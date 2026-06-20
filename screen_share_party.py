@@ -484,8 +484,10 @@ class ScreenShareApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Watch")
-        self.geometry("1180x820")
+        self._center_window(1180, 820)
         self.minsize(760, 560)
+        self.overrideredirect(True)
+        self._drag_start = None
 
         self.capture = ScreenCapture()
         self.latest_frame = None
@@ -530,6 +532,7 @@ class ScreenShareApp(tk.Tk):
 
         self._build_ui()
         self.bind("<Escape>", lambda _event: self.exit_fullscreen())
+        self.bind("<Map>", self._restore_borderless)
         self._schedule_preview()
 
     def _build_ui(self):
@@ -616,9 +619,15 @@ class ScreenShareApp(tk.Tk):
         self.header.columnconfigure(2, weight=1)
         self.header.columnconfigure(3, weight=0)
         self.header.columnconfigure(4, weight=0)
+        self.header.columnconfigure(5, weight=0)
+        self.header.columnconfigure(6, weight=0)
+        self.header.bind("<ButtonPress-1>", self._start_window_drag)
+        self.header.bind("<B1-Motion>", self._drag_window)
 
         self.brand_frame = tk.Frame(self.header, bg=BG)
         self.brand_frame.grid(row=0, column=0, sticky="w")
+        self.brand_frame.bind("<ButtonPress-1>", self._start_window_drag)
+        self.brand_frame.bind("<B1-Motion>", self._drag_window)
         
         self.logo_label = tk.Label(
             self.brand_frame,
@@ -629,6 +638,8 @@ class ScreenShareApp(tk.Tk):
             padx=0,
         )
         self.logo_label.pack(side=tk.LEFT)
+        self.logo_label.bind("<ButtonPress-1>", self._start_window_drag)
+        self.logo_label.bind("<B1-Motion>", self._drag_window)
 
         self.logo_mark = tk.Label(
             self.brand_frame,
@@ -640,6 +651,8 @@ class ScreenShareApp(tk.Tk):
             pady=3,
         )
         self.logo_mark.pack(side=tk.LEFT, padx=(10, 0))
+        self.logo_mark.bind("<ButtonPress-1>", self._start_window_drag)
+        self.logo_mark.bind("<B1-Motion>", self._drag_window)
         
         self.nav_frame = tk.Frame(self.header, bg=BG)
         self.nav_frame.grid(row=0, column=1, sticky="w", padx=(22, 0))
@@ -676,6 +689,12 @@ class ScreenShareApp(tk.Tk):
         self.theme_toggle_btn.bind("<Enter>", lambda _event: self._draw_theme_icon(hover=True))
         self.theme_toggle_btn.bind("<Leave>", lambda _event: self._draw_theme_icon(hover=False))
         self._draw_theme_icon()
+
+        self.minimize_button = self._window_control_button("-", self._minimize_window)
+        self.minimize_button.grid(row=0, column=5, sticky="e", padx=(8, 0))
+
+        self.close_button = self._window_control_button("X", self.destroy, danger=True)
+        self.close_button.grid(row=0, column=6, sticky="e", padx=(6, 0))
         
         self.status_label = tk.Label(
             self.header,
@@ -695,6 +714,52 @@ class ScreenShareApp(tk.Tk):
         self._build_room_page()
         self._build_session_page()
         self._show_page("name")
+
+    def _window_control_button(self, text, command, danger=False):
+        bg = "#7F1D1D" if danger else SURFACE
+        hover = "#991B1B" if danger else BORDER
+        btn = tk.Button(
+            self.header,
+            text=text,
+            command=command,
+            bg=bg,
+            activebackground=hover,
+            fg=TEXT,
+            activeforeground=TEXT,
+            relief=tk.FLAT,
+            bd=0,
+            cursor="hand2",
+            font=("Segoe UI", 11, "bold"),
+            width=3,
+            pady=6,
+        )
+        btn.bind("<Enter>", lambda _event: btn.configure(bg=hover))
+        btn.bind("<Leave>", lambda _event: btn.configure(bg=bg))
+        return btn
+
+    def _center_window(self, width, height):
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        x = max(0, (screen_width - width) // 2)
+        y = max(0, (screen_height - height) // 2)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _start_window_drag(self, event):
+        self._drag_start = (event.x_root - self.winfo_x(), event.y_root - self.winfo_y())
+
+    def _drag_window(self, event):
+        if not self._drag_start:
+            return
+        x_offset, y_offset = self._drag_start
+        self.geometry(f"+{event.x_root - x_offset}+{event.y_root - y_offset}")
+
+    def _minimize_window(self):
+        self.overrideredirect(False)
+        self.iconify()
+
+    def _restore_borderless(self, _event=None):
+        if self.state() == "normal":
+            self.after(10, lambda: self.overrideredirect(True))
 
     def toggle_theme(self):
         if self.theme_mode.get() == "dark":
@@ -828,6 +893,10 @@ class ScreenShareApp(tk.Tk):
             self.status_label.configure(bg=PANEL_2, fg=TEXT)
         if hasattr(self, "theme_toggle_btn") and self.theme_toggle_btn.winfo_exists():
             self._draw_theme_icon()
+        if hasattr(self, "minimize_button") and self.minimize_button.winfo_exists():
+            self.minimize_button.configure(bg=SURFACE, activebackground=BORDER, fg=TEXT, activeforeground=TEXT)
+        if hasattr(self, "close_button") and self.close_button.winfo_exists():
+            self.close_button.configure(bg="#7F1D1D", activebackground="#991B1B", fg=TEXT, activeforeground=TEXT)
         if hasattr(self, "source_combo") and self.source_combo.winfo_exists():
             self.source_combo.configure(style="Source.TCombobox")
             
