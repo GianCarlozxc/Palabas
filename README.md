@@ -22,6 +22,6 @@ Both computers need to be on the same network. If Windows Firewall asks, allow P
 
 ## Performance
 
-The stream targets up to 55 FPS at 320x180. The app only sends newly captured frames, so actual unique FPS depends on how fast Windows screen capture runs on the host.
+The stream targets up to 10 FPS at 1280x720 and sends JPEG-compressed frames to balance sharper video with low Wi-Fi latency. The viewer drops stale compressed frames before decoding, renders only the newest frame, and scales display output up to 1600x900.
 
 Use `Entire screen` to show everything. Select Chrome or another app in `Source` to stream only that window rectangle. The Watch Party control window minimizes when app-only sharing starts so it does not cover the selected app.
