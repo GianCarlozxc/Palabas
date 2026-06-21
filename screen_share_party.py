@@ -2,6 +2,7 @@ import ctypes
 import ctypes.wintypes
 import io
 import json
+import os
 import queue
 import secrets
 import socket
@@ -16,6 +17,7 @@ from PIL import Image, ImageTk
 
 FRAME_HEADER = struct.Struct("!III")
 DEFAULT_PORT = 5050
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watch_settings.json")
 STREAM_FPS = 10
 VIEWER_RENDER_FPS = 10
 CAPTURE_INTERVAL_MS = int(1000 / STREAM_FPS)
@@ -30,8 +32,17 @@ MAX_RENDER_HEIGHT = 900
 MAX_FULLSCREEN_RENDER_WIDTH = 1280
 MAX_FULLSCREEN_RENDER_HEIGHT = 720
 JPEG_QUALITY = 68
+QUALITY_PROFILES = {
+    "Low": {"quality": 45, "width": 960, "height": 540},
+    "Balanced": {"quality": 68, "width": 1280, "height": 720},
+    "High": {"quality": 82, "width": 1600, "height": 900},
+}
+MAX_FRAME_WIDTH = 4096
+MAX_FRAME_HEIGHT = 2160
+MAX_PAYLOAD_SIZE = 8 * 1024 * 1024
 SOCKET_BUFFER_SIZE = 65536
 SEND_TIMEOUT_SECONDS = 0.08
+RECONNECT_DELAY_MS = 3000
 WAITING_FRAME = bytes([8, 8, 8]) * WAITING_WIDTH * WAITING_HEIGHT
 BG = "#090A0F"
 PANEL = "#11131C"
@@ -261,10 +272,23 @@ def scale_rgb_frame(width, height, rgb, target_width, target_height):
     return new_width, new_height, bytes(scaled)
 
 
-def make_packet(width, height, rgb):
+class ProtocolError(ConnectionError):
+    pass
+
+
+def validate_frame_header(width, height, payload_size):
+    if width <= 0 or height <= 0:
+        raise ProtocolError("Stream sent an invalid frame size")
+    if width > MAX_FRAME_WIDTH or height > MAX_FRAME_HEIGHT:
+        raise ProtocolError("Stream frame is too large")
+    if payload_size <= 0 or payload_size > MAX_PAYLOAD_SIZE:
+        raise ProtocolError("Stream payload is too large")
+
+
+def make_packet(width, height, rgb, jpeg_quality=JPEG_QUALITY):
     image = Image.frombytes("RGB", (width, height), rgb)
     payload_buffer = io.BytesIO()
-    image.save(payload_buffer, format="JPEG", quality=JPEG_QUALITY, optimize=False, subsampling=2)
+    image.save(payload_buffer, format="JPEG", quality=jpeg_quality, optimize=False, subsampling=2)
     payload = payload_buffer.getvalue()
     return FRAME_HEADER.pack(width, height, len(payload)) + payload
 
@@ -276,7 +300,10 @@ def decode_packet_payload(width, height, payload):
             image = image.convert("RGB")
         return image.size[0], image.size[1], image.tobytes()
     except Exception:
-        return width, height, zlib.decompress(payload)
+        try:
+            return width, height, zlib.decompress(payload)
+        except zlib.error as exc:
+            raise ValueError(f"Could not decode frame payload: {exc}") from exc
 
 
 def recv_exact(sock, size):
@@ -287,6 +314,13 @@ def recv_exact(sock, size):
             raise ConnectionError("Connection closed")
         data.extend(chunk)
     return bytes(data)
+
+
+def recv_frame(sock):
+    header = recv_exact(sock, FRAME_HEADER.size)
+    width, height, payload_size = FRAME_HEADER.unpack(header)
+    validate_frame_header(width, height, payload_size)
+    return width, height, recv_exact(sock, payload_size)
 
 
 def recv_line(sock, limit=4096):
@@ -301,15 +335,22 @@ def recv_line(sock, limit=4096):
     raise ConnectionError("Handshake too large")
 
 
+def send_line(sock, payload):
+    sock.sendall(json.dumps(payload).encode("utf-8") + b"\n")
+
+
 class ShareServer:
-    def __init__(self, port, room_code, packet_source, status_callback):
+    def __init__(self, port, room_code, packet_source, status_callback, failure_callback=None, viewers_callback=None):
         self.port = port
         self.room_code = room_code
         self.packet_source = packet_source
         self.status_callback = status_callback
+        self.failure_callback = failure_callback
+        self.viewers_callback = viewers_callback
         self.stop_event = threading.Event()
         self.clients = []
         self.client_versions = {}
+        self.client_names = {}
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self._run, daemon=True)
 
@@ -322,25 +363,55 @@ class ShareServer:
         except RuntimeError:
             pass
 
+    def _failure(self, value):
+        if not self.failure_callback:
+            return
+        try:
+            self.failure_callback(value)
+        except RuntimeError:
+            pass
+
+    def _viewers_changed(self):
+        if not self.viewers_callback:
+            return
+        try:
+            with self.lock:
+                viewers = list(self.client_names.values())
+            self.viewers_callback(viewers)
+        except RuntimeError:
+            pass
+
     def stop(self):
         self.stop_event.set()
         with self.lock:
             clients = list(self.clients)
             self.clients.clear()
             self.client_versions.clear()
+            self.client_names.clear()
         for client in clients:
             try:
                 client.shutdown(socket.SHUT_RDWR)
                 client.close()
             except OSError:
                 pass
+        self._viewers_changed()
 
     def _run(self):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind(("", self.port))
-        listener.listen()
-        listener.settimeout(0.25)
+        try:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("", self.port))
+            listener.listen()
+            listener.settimeout(0.25)
+        except (OSError, OverflowError) as exc:
+            self.stop_event.set()
+            try:
+                listener.close()
+            except OSError:
+                pass
+            self._status(f"Could not share on port {self.port}: {exc}")
+            self._failure(str(exc))
+            return
         self._status(f"Sharing on port {self.port}")
 
         accept_thread = threading.Thread(target=self._accept_clients, args=(listener,), daemon=True)
@@ -373,10 +444,12 @@ class ShareServer:
                             if client in self.clients:
                                 self.clients.remove(client)
                             self.client_versions.pop(client, None)
+                            self.client_names.pop(client, None)
                             try:
                                 client.close()
                             except OSError:
                                 pass
+                    self._viewers_changed()
 
                 time.sleep(1 / STREAM_FPS)
         finally:
@@ -394,18 +467,22 @@ class ShareServer:
                 client.settimeout(5)
                 hello = json.loads(recv_line(client).decode("utf-8"))
                 if hello.get("room", "").upper() != self.room_code:
+                    send_line(client, {"ok": False, "reason": "Wrong room code"})
                     client.close()
                     self._status(f"Rejected wrong room code from {addr[0]}")
                     continue
                 viewer_name = hello.get("name", "Viewer").strip() or "Viewer"
+                send_line(client, {"ok": True})
                 client.settimeout(SEND_TIMEOUT_SECONDS)
                 client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 client.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUFFER_SIZE)
                 with self.lock:
                     self.clients.append(client)
                     self.client_versions[client] = None
+                    self.client_names[client] = viewer_name
                     count = len(self.clients)
                 self._status(f"{viewer_name} connected from {addr[0]} ({count})")
+                self._viewers_changed()
             except socket.timeout:
                 if client:
                     client.close()
@@ -423,13 +500,14 @@ class ShareServer:
 
 
 class ViewerClient:
-    def __init__(self, host, port, room_code, viewer_name, frame_queue, status_callback):
+    def __init__(self, host, port, room_code, viewer_name, frame_queue, status_callback, stopped_callback=None):
         self.host = host
         self.port = port
         self.room_code = room_code
         self.viewer_name = viewer_name
         self.frame_queue = frame_queue
         self.status_callback = status_callback
+        self.stopped_callback = stopped_callback
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.sock = None
@@ -440,6 +518,14 @@ class ViewerClient:
     def _status(self, value):
         try:
             self.status_callback(value)
+        except RuntimeError:
+            pass
+
+    def _stopped(self, reason):
+        if not self.stopped_callback:
+            return
+        try:
+            self.stopped_callback(reason)
         except RuntimeError:
             pass
 
@@ -460,16 +546,19 @@ class ViewerClient:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER_SIZE)
             hello = json.dumps({"room": self.room_code, "name": self.viewer_name}).encode("utf-8") + b"\n"
             self.sock.sendall(hello)
+            response = json.loads(recv_line(self.sock).decode("utf-8"))
+            if not response.get("ok"):
+                raise ProtocolError(response.get("reason", "Host rejected the connection"))
             self.sock.settimeout(None)
             self._status("Watching shared screen")
             while not self.stop_event.is_set():
-                header = recv_exact(self.sock, FRAME_HEADER.size)
-                width, height, payload_size = FRAME_HEADER.unpack(header)
-                payload = recv_exact(self.sock, payload_size)
+                width, height, payload = recv_frame(self.sock)
                 self._push_frame(width, height, payload, True)
         except Exception as exc:
             if not self.stop_event.is_set():
-                self._status(f"Viewer stopped: {exc}")
+                reason = str(exc)
+                self._status(f"Viewer stopped: {reason}")
+                self._stopped(reason)
 
     def _push_frame(self, width, height, frame_data, encoded=False):
         try:
@@ -515,11 +604,14 @@ class ScreenShareApp(tk.Tk):
         self.join_code = tk.StringVar()
         self.host_share_screen = tk.BooleanVar(value=False)
         self.share_enabled = False
-        self.host_audio_enabled = tk.BooleanVar(value=False)
+        self.share_paused = tk.BooleanVar(value=False)
         self.share_source = tk.StringVar(value="Entire screen")
+        self.quality_profile = tk.StringVar(value="Balanced")
         self.selected_source_name = "Entire screen"
         self.window_sources = {}
         self.current_source_label = tk.StringVar(value="Source: Entire screen")
+        self.viewer_count = tk.StringVar(value="No viewers connected")
+        self.viewer_list = tk.StringVar(value="Waiting for viewers")
         self.status = tk.StringVar(value="Ready")
         self.frames = {}
         self.display = None
@@ -527,12 +619,21 @@ class ScreenShareApp(tk.Tk):
         self.fullscreen_window = None
         self.fullscreen_display = None
         self.fullscreen_rendering = False
+        self.fullscreen_hint_id = None
+        self.fullscreen_cursor_job = None
         self.start_button = None
         self.stop_button = None
+        self.reconnect_button = None
+        self.pause_button = None
+        self.auto_reconnect_enabled = tk.BooleanVar(value=True)
+        self.reconnect_job = None
+        self.reconnect_attempts = 0
 
         self._build_ui()
+        self._load_settings()
         self.bind("<Escape>", lambda _event: self.exit_fullscreen())
         self.bind("<Map>", self._restore_borderless)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
         self._schedule_preview()
 
     def _build_ui(self):
@@ -1097,10 +1198,34 @@ class ScreenShareApp(tk.Tk):
         self.display.bind("<Double-Button-1>", lambda _event: self.enter_fullscreen())
         self.display.bind("<Configure>", lambda _event: self._rerender_current_frame())
 
-        controls = ttk.Frame(body, style="Panel.TFrame", padding=16)
-        controls.grid(row=0, column=1, sticky="ns")
-        controls.configure(width=320)
-        controls.grid_propagate(False)
+        controls_shell = ttk.Frame(body, style="Panel.TFrame")
+        controls_shell.grid(row=0, column=1, sticky="ns")
+        controls_shell.configure(width=320)
+        controls_shell.grid_propagate(False)
+
+        controls_canvas = tk.Canvas(
+            controls_shell,
+            bg=PANEL,
+            highlightthickness=0,
+            borderwidth=0,
+            width=320,
+        )
+        controls_scrollbar = ttk.Scrollbar(controls_shell, orient=tk.VERTICAL, command=controls_canvas.yview)
+        controls_canvas.configure(yscrollcommand=controls_scrollbar.set)
+        controls_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        controls_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        controls = ttk.Frame(controls_canvas, style="Panel.TFrame", padding=16)
+        controls_window = controls_canvas.create_window((0, 0), window=controls, anchor="nw", width=300)
+
+        def sync_scroll_region(_event=None):
+            controls_canvas.configure(scrollregion=controls_canvas.bbox("all"))
+
+        def sync_controls_width(event):
+            controls_canvas.itemconfigure(controls_window, width=max(280, event.width - 18))
+
+        controls.bind("<Configure>", sync_scroll_region)
+        controls_canvas.bind("<Configure>", sync_controls_width)
 
         ttk.Label(
             controls,
@@ -1156,22 +1281,13 @@ class ScreenShareApp(tk.Tk):
             font=("Segoe UI", 9, "bold"),
             anchor="w",
         ).pack(fill=tk.X, pady=(0, 4))
-        tk.Checkbutton(
+        ttk.Label(
             self.host_options,
-            text="Audio on",
-            variable=self.host_audio_enabled,
-            command=self._update_audio_state,
-            bg=PANEL_2,
-            activebackground=PANEL_2,
-            fg=TEXT,
-            activeforeground=TEXT,
-            selectcolor=INPUT,
-            relief=tk.FLAT,
-            bd=0,
-            cursor="hand2",
+            text="Video only",
+            style="Card.TLabel",
+            foreground=MUTED,
             font=("Segoe UI", 9, "bold"),
-            anchor="w",
-        ).pack(fill=tk.X)
+        ).pack(anchor="w", pady=(0, 4))
         ttk.Label(
             self.host_options,
             text="SOURCE",
@@ -1189,9 +1305,26 @@ class ScreenShareApp(tk.Tk):
         self.source_combo.pack(fill=tk.X)
         self.source_combo.bind("<<ComboboxSelected>>", self._select_source)
         self._small_button(self.host_options, "REFRESH SOURCES", self.refresh_sources).pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(
+            self.host_options,
+            text="QUALITY",
+            style="Card.TLabel",
+            foreground=MUTED,
+            font=("Segoe UI", 8, "bold"),
+        ).pack(anchor="w", pady=(14, 5))
+        self.quality_combo = ttk.Combobox(
+            self.host_options,
+            textvariable=self.quality_profile,
+            values=list(QUALITY_PROFILES.keys()),
+            state="readonly",
+            style="Source.TCombobox",
+            font=("Segoe UI", 9),
+        )
+        self.quality_combo.pack(fill=tk.X)
+        self.quality_combo.bind("<<ComboboxSelected>>", self._select_quality)
         self.audio_note = ttk.Label(
             self.host_options,
-            text="Pick a window source to reduce capture work and keep viewers smoother.",
+            text="Audio streaming is not implemented; this room shares video only.",
             style="Card.TLabel",
             foreground=MUTED,
             wraplength=250,
@@ -1212,6 +1345,28 @@ class ScreenShareApp(tk.Tk):
         self.stop_button = self._button(controls, "STOP", self.stop)
         self.stop_button.configure(state=tk.DISABLED)
         self.stop_button.pack(fill=tk.X)
+        self.pause_button = self._button(controls, "PAUSE SHARING", self.toggle_pause_sharing)
+        self.pause_button.configure(state=tk.DISABLED)
+        self.pause_button.pack(fill=tk.X, pady=(8, 0))
+        self.reconnect_button = self._button(controls, "RECONNECT", self.reconnect)
+        self.reconnect_button.configure(state=tk.DISABLED)
+        self.reconnect_button.pack(fill=tk.X, pady=(8, 0))
+        self.auto_reconnect_check = tk.Checkbutton(
+            controls,
+            text="Auto reconnect",
+            variable=self.auto_reconnect_enabled,
+            bg=PANEL,
+            activebackground=PANEL,
+            fg=TEXT,
+            activeforeground=TEXT,
+            selectcolor=INPUT,
+            relief=tk.FLAT,
+            bd=0,
+            cursor="hand2",
+            font=("Segoe UI", 9, "bold"),
+            anchor="w",
+        )
+        self.auto_reconnect_check.pack(fill=tk.X, pady=(8, 0))
 
         self.fullscreen_button = self._button(controls, "FULLSCREEN", self.enter_fullscreen)
         self.fullscreen_button.pack(fill=tk.X, pady=(8, 0))
@@ -1229,7 +1384,15 @@ class ScreenShareApp(tk.Tk):
             font=("Consolas", 14, "bold"),
         )
         self.lan_address_label.pack(anchor="w", pady=(6, 0))
+        self._small_button(info, "COPY ADDRESS", self.copy_lan_address).pack(fill=tk.X, pady=(10, 0))
+        self._small_button(info, "COPY ROOM INFO", self.copy_room_info).pack(fill=tk.X, pady=(8, 0))
         ttk.Label(info, text="Give this to viewers on your Wi-Fi.", style="Card.TLabel", foreground=MUTED, wraplength=245).pack(anchor="w", pady=(10, 0))
+
+        self.viewers_card = ttk.Frame(controls, style="Card.TFrame", padding=14)
+        self.viewers_card.pack(fill=tk.X, pady=(14, 0))
+        ttk.Label(self.viewers_card, text="VIEWERS", style="Card.TLabel", foreground=MUTED, font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        ttk.Label(self.viewers_card, textvariable=self.viewer_count, style="Card.TLabel", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(6, 0))
+        ttk.Label(self.viewers_card, textvariable=self.viewer_list, style="Card.TLabel", foreground=MUTED, wraplength=245).pack(anchor="w", pady=(6, 0))
 
     def continue_to_rooms(self):
         name = self.user_name.get().strip()
@@ -1237,6 +1400,7 @@ class ScreenShareApp(tk.Tk):
             messagebox.showerror("Name required", "Enter your name before continuing.")
             return
         self.status.set(f"Signed in as {name}")
+        self._save_settings()
         self._show_page("room")
 
     def create_room(self):
@@ -1245,7 +1409,8 @@ class ScreenShareApp(tk.Tk):
         self.mode.set("share")
         self.host_share_screen.set(False)
         self.share_enabled = False
-        self.host_audio_enabled.set(False)
+        self.share_paused.set(False)
+        self._update_viewers([])
         self.refresh_sources()
         self.lan_address_label.configure(text=f"{self._local_ip()}:{self.port.get()}")
         self.session_title.configure(text="Share Screen")
@@ -1255,14 +1420,22 @@ class ScreenShareApp(tk.Tk):
         self.display.configure(text=self._host_waiting_text(), image="")
         self.start_button.configure(state=tk.NORMAL)
         self.stop_button.configure(state=tk.DISABLED)
+        self.pause_button.configure(state=tk.DISABLED, text="PAUSE SHARING")
+        self.reconnect_button.configure(state=tk.DISABLED)
+        self.auto_reconnect_check.pack_forget()
+        self._save_settings()
         self._show_page("session")
 
     def join_room(self):
         code = self.join_code.get().strip().upper()
         host = self.host.get().strip()
         self._apply_host_port()
+        host = self.host.get().strip()
         if not host or not code:
             messagebox.showerror("Room required", "Enter the host address and room code.")
+            return
+        if not self._valid_host(host):
+            messagebox.showerror("Invalid host", "Enter a valid host name or IP address.")
             return
         self.room_code.set(code)
         self.mode.set("watch")
@@ -1270,15 +1443,21 @@ class ScreenShareApp(tk.Tk):
         self.room_code_label.configure(text=code)
         self.name_label.configure(text=f"Viewer: {self.user_name.get().strip()}")
         self.host_options.pack_forget()
+        self._update_viewers([])
         self.display.configure(text="Click Start to join the room.", image="")
         self.start_button.configure(state=tk.NORMAL)
         self.stop_button.configure(state=tk.DISABLED)
+        self.pause_button.configure(state=tk.DISABLED)
+        self.reconnect_button.configure(state=tk.NORMAL)
+        self.auto_reconnect_check.pack(fill=tk.X, pady=(8, 0))
+        self._save_settings()
         self._show_page("session")
 
     def back_to_rooms(self):
         self.stop()
         self.photo = None
         self.display.configure(text="No active stream", image="")
+        self._save_settings()
         self._show_page("room")
 
     def _local_ip(self):
@@ -1301,13 +1480,24 @@ class ScreenShareApp(tk.Tk):
         except (TypeError, ValueError):
             messagebox.showerror("Invalid port", "Enter a valid numeric port.")
             return
+        if not 1 <= port <= 65535:
+            messagebox.showerror("Invalid port", "Enter a port from 1 to 65535.")
+            return
+        if self.mode.get() == "watch" and not self._valid_host(self.host.get().strip()):
+            messagebox.showerror("Invalid host", "Enter a valid host name or IP address.")
+            return
 
         self.start_button.configure(state=tk.DISABLED)
         self.stop_button.configure(state=tk.NORMAL)
+        self.reconnect_button.configure(state=tk.DISABLED)
+        self._cancel_reconnect()
+        self._save_settings()
 
         if self.mode.get() == "share":
             self.client = None
             self.share_enabled = self.host_share_screen.get()
+            self.share_paused.set(False)
+            self.pause_button.configure(state=tk.NORMAL, text="PAUSE SHARING")
             self._focus_selected_source()
             if self.share_enabled:
                 self._start_capture_thread()
@@ -1316,7 +1506,14 @@ class ScreenShareApp(tk.Tk):
                     self.latest_frame = self._waiting_frame()
                     self.latest_packet = self.waiting_packet
                     self.latest_packet_version += 1
-            self.server = ShareServer(port, self.room_code.get(), self._host_packet, self._set_status)
+            self.server = ShareServer(
+                port,
+                self.room_code.get(),
+                self._host_packet,
+                self._set_status,
+                self._handle_server_start_failed,
+                self._handle_viewers_changed,
+            )
             self.server.start()
             if self.selected_source_name != "Entire screen" and self.share_enabled:
                 self.after(300, self.iconify)
@@ -1329,6 +1526,7 @@ class ScreenShareApp(tk.Tk):
                 self.user_name.get().strip(),
                 self.viewer_frames,
                 self._set_status,
+                self._handle_viewer_stopped,
             )
             self.client.start()
 
@@ -1340,8 +1538,18 @@ class ScreenShareApp(tk.Tk):
                 self.host.set(address)
                 self.port.set(int(port))
 
+    def _valid_host(self, host):
+        if not host or any(char.isspace() for char in host):
+            return False
+        try:
+            socket.getaddrinfo(host, None)
+            return True
+        except socket.gaierror:
+            return False
+
     def stop(self):
         self._stop_capture_thread()
+        self._cancel_reconnect()
         if self.server:
             self.server.stop()
             self.server = None
@@ -1352,10 +1560,150 @@ class ScreenShareApp(tk.Tk):
             self.start_button.configure(state=tk.NORMAL)
         if self.stop_button:
             self.stop_button.configure(state=tk.DISABLED)
+        if self.pause_button:
+            self.pause_button.configure(state=tk.DISABLED, text="PAUSE SHARING")
+        if self.reconnect_button:
+            self.reconnect_button.configure(state=tk.NORMAL if self.mode.get() == "watch" else tk.DISABLED)
+        self.share_paused.set(False)
+        self._save_settings()
         self._set_status("Stopped")
+
+    def reconnect(self):
+        if self.mode.get() != "watch":
+            return
+        self.stop()
+        self.start()
+
+    def _schedule_reconnect(self, reason):
+        if self.mode.get() != "watch" or not self.auto_reconnect_enabled.get():
+            return
+        if self.reconnect_job:
+            return
+        self.reconnect_attempts += 1
+        self.status.set(f"Viewer stopped: {reason}. Reconnecting in 3s...")
+        self.reconnect_job = self.after(RECONNECT_DELAY_MS, self._run_scheduled_reconnect)
+
+    def _run_scheduled_reconnect(self):
+        self.reconnect_job = None
+        if self.mode.get() == "watch" and not self.client:
+            self.start()
+
+    def _cancel_reconnect(self):
+        if self.reconnect_job:
+            try:
+                self.after_cancel(self.reconnect_job)
+            except tk.TclError:
+                pass
+            self.reconnect_job = None
+
+    def _handle_server_start_failed(self, reason):
+        def restore_controls():
+            self._stop_capture_thread()
+            self.server = None
+            if self.start_button:
+                self.start_button.configure(state=tk.NORMAL)
+            if self.stop_button:
+                self.stop_button.configure(state=tk.DISABLED)
+            if self.reconnect_button:
+                self.reconnect_button.configure(state=tk.DISABLED)
+            self.status.set(f"Host failed: {reason}")
+
+        self.after(0, restore_controls)
+
+    def _handle_viewer_stopped(self, reason):
+        def restore_controls():
+            self.client = None
+            if self.start_button:
+                self.start_button.configure(state=tk.NORMAL)
+            if self.stop_button:
+                self.stop_button.configure(state=tk.DISABLED)
+            if self.reconnect_button:
+                self.reconnect_button.configure(state=tk.NORMAL)
+            if self.auto_reconnect_enabled.get():
+                self._schedule_reconnect(reason)
+            else:
+                self.status.set(f"Viewer stopped: {reason}")
+
+        self.after(0, restore_controls)
+
+    def toggle_pause_sharing(self):
+        if self.mode.get() != "share":
+            return
+        paused = not self.share_paused.get()
+        self.share_paused.set(paused)
+        if paused:
+            self.share_enabled = False
+            self._stop_capture_thread()
+            with self.packet_lock:
+                self.latest_frame = self._waiting_frame()
+                self.latest_packet = self.waiting_packet
+                self.latest_packet_version += 1
+            self.pause_button.configure(text="RESUME SHARING")
+            self.display.configure(text="Sharing is paused.", image="")
+            self._set_status("Sharing paused")
+        else:
+            self.share_enabled = self.host_share_screen.get()
+            self.pause_button.configure(text="PAUSE SHARING")
+            if self.share_enabled:
+                self._start_capture_thread()
+            self.display.configure(text=self._host_waiting_text(), image="")
+            self._set_status("Sharing resumed")
+
+    def _handle_viewers_changed(self, viewers):
+        self.after(0, lambda: self._update_viewers(viewers))
+
+    def _update_viewers(self, viewers):
+        count = len(viewers)
+        self.viewer_count.set(f"{count} viewer{'s' if count != 1 else ''} connected")
+        self.viewer_list.set(", ".join(viewers) if viewers else "Waiting for viewers")
+
+    def copy_lan_address(self):
+        value = self.lan_address_label.cget("text")
+        self.clipboard_clear()
+        self.clipboard_append(value)
+        self._set_status("LAN address copied")
+
+    def copy_room_info(self):
+        value = f"{self.lan_address_label.cget('text')} / {self.room_code.get()}"
+        self.clipboard_clear()
+        self.clipboard_append(value)
+        self._set_status("Room info copied")
 
     def _set_status(self, value):
         self.after(0, self.status.set, value)
+
+    def _load_settings(self):
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as settings_file:
+                settings = json.load(settings_file)
+        except (OSError, ValueError):
+            return
+        self.user_name.set(str(settings.get("user_name", "")))
+        self.host.set(str(settings.get("host", self.host.get())))
+        try:
+            self.port.set(int(settings.get("port", self.port.get())))
+        except (TypeError, ValueError, tk.TclError):
+            self.port.set(DEFAULT_PORT)
+        quality = settings.get("quality", self.quality_profile.get())
+        if quality in QUALITY_PROFILES:
+            self.quality_profile.set(quality)
+        self.mode.set(settings.get("last_mode", self.mode.get()) if settings.get("last_mode") in ("share", "watch") else self.mode.get())
+        self.auto_reconnect_enabled.set(bool(settings.get("auto_reconnect", True)))
+
+    def _save_settings(self):
+        settings = {
+            "user_name": self.user_name.get().strip(),
+            "host": self.host.get().strip(),
+            "port": self.port.get(),
+            "quality": self.quality_profile.get(),
+            "last_mode": self.mode.get(),
+            "auto_reconnect": self.auto_reconnect_enabled.get(),
+        }
+        try:
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as settings_file:
+                json.dump(settings, settings_file, indent=2)
+        except OSError as exc:
+            self.status.set(f"Could not save settings: {exc}")
 
     def _schedule_preview(self):
         try:
@@ -1363,7 +1711,7 @@ class ScreenShareApp(tk.Tk):
                 return
             if self.client:
                 self._show_viewer_frame()
-            elif self.mode.get() == "share" and self.server and self.host_share_screen.get():
+            elif self.mode.get() == "share" and self.server and self.host_share_screen.get() and not self.share_paused.get():
                 self._show_host_preview()
             elif self.mode.get() == "share":
                 with self.packet_lock:
@@ -1375,13 +1723,13 @@ class ScreenShareApp(tk.Tk):
             self.after(CAPTURE_INTERVAL_MS, self._schedule_preview)
 
     def _host_frame(self):
-        if self.host_share_screen.get():
+        if self.host_share_screen.get() and not self.share_paused.get():
             return self.latest_frame
         return self._waiting_frame()
 
     def _host_packet(self):
         with self.packet_lock:
-            if self.share_enabled:
+            if self.share_enabled and not self.share_paused.get():
                 if self.latest_packet is None:
                     return -1, self.waiting_packet
                 return self.latest_packet_version, self.latest_packet
@@ -1407,7 +1755,7 @@ class ScreenShareApp(tk.Tk):
         while self.capture_stop_event and not self.capture_stop_event.is_set():
             try:
                 frame = self._capture_selected_source()
-                packet = make_packet(*frame)
+                packet = make_packet(*frame, jpeg_quality=self._quality_settings()["quality"])
                 with self.packet_lock:
                     self.latest_frame = frame
                     self.latest_packet = packet
@@ -1424,17 +1772,28 @@ class ScreenShareApp(tk.Tk):
 
     def _capture_selected_source(self):
         source = self.selected_source_name
+        settings = self._quality_settings()
+        max_width = settings["width"]
+        max_height = settings["height"]
         if source == "Entire screen":
-            return self.capture.capture()
+            return self.capture.capture(max_width=max_width, max_height=max_height)
         hwnd = self.window_sources.get(source)
         if not hwnd:
             raise RuntimeError("Selected source is no longer available")
-        return self.capture.capture_window(hwnd)
+        return self.capture.capture_window(hwnd, max_width=max_width, max_height=max_height)
+
+    def _quality_settings(self):
+        return QUALITY_PROFILES.get(self.quality_profile.get(), QUALITY_PROFILES["Balanced"])
+
+    def _select_quality(self, _event=None):
+        self._set_status(f"Quality: {self.quality_profile.get()}")
 
     def _waiting_frame(self):
         return WAITING_WIDTH, WAITING_HEIGHT, WAITING_FRAME
 
     def _host_waiting_text(self):
+        if self.share_paused.get():
+            return "Sharing is paused."
         if self.host_share_screen.get():
             if self.server:
                 return "Sharing this screen."
@@ -1445,7 +1804,10 @@ class ScreenShareApp(tk.Tk):
         if self.mode.get() != "share" or not self.display:
             return
         self.photo = None
+        self.share_paused.set(False)
         self.share_enabled = self.host_share_screen.get()
+        if self.pause_button:
+            self.pause_button.configure(text="PAUSE SHARING")
         self.display.configure(text=self._host_waiting_text(), image="")
         if self.share_enabled:
             self._focus_selected_source()
@@ -1457,12 +1819,6 @@ class ScreenShareApp(tk.Tk):
                 self.latest_frame = self._waiting_frame()
                 self.latest_packet = self.waiting_packet
                 self.latest_packet_version += 1
-
-    def _update_audio_state(self):
-        if self.host_audio_enabled.get():
-            self._set_status("Audio is on in settings; video stream is active only")
-        else:
-            self._set_status("Audio off")
 
     def refresh_sources(self):
         self.window_sources = {}
@@ -1507,15 +1863,16 @@ class ScreenShareApp(tk.Tk):
     def _show_local_frame(self):
         try:
             source = self.share_source.get()
+            settings = self._quality_settings()
             if source == "Entire screen":
-                frame = self.capture.capture()
+                frame = self.capture.capture(max_width=settings["width"], max_height=settings["height"])
             else:
                 hwnd = self.window_sources.get(source)
                 if not hwnd:
                     raise RuntimeError("Selected source is no longer available")
-                frame = self.capture.capture_window(hwnd)
+                frame = self.capture.capture_window(hwnd, max_width=settings["width"], max_height=settings["height"])
             self.latest_frame = frame
-            self.latest_packet = make_packet(*frame)
+            self.latest_packet = make_packet(*frame, jpeg_quality=self._quality_settings()["quality"])
             self.latest_packet_version += 1
             now = time.monotonic()
             if now - self.last_preview_time >= PREVIEW_INTERVAL_MS / 1000:
@@ -1554,8 +1911,18 @@ class ScreenShareApp(tk.Tk):
             return
         width, height, frame_data, encoded = frame_info
         if encoded:
-            width, height, frame_data = decode_packet_payload(width, height, frame_data)
+            try:
+                width, height, frame_data = decode_packet_payload(width, height, frame_data)
+            except ValueError as exc:
+                self._set_status(str(exc))
+                return
         self.last_viewer_render_time = now
+        if width == WAITING_WIDTH and height == WAITING_HEIGHT and frame_data == WAITING_FRAME:
+            self.current_rgb_frame = None
+            self.photo = None
+            if self.display:
+                self.display.configure(text="Host is connected. Screen sharing is off or paused.", image="")
+            return
         self._render_frame(width, height, frame_data)
 
     def _render_frame(self, width, height, rgb):
@@ -1629,6 +1996,7 @@ class ScreenShareApp(tk.Tk):
         self.fullscreen_window.attributes("-fullscreen", True)
         self.fullscreen_window.bind("<Escape>", lambda _event: self.exit_fullscreen())
         self.fullscreen_window.protocol("WM_DELETE_WINDOW", self.exit_fullscreen)
+        self.fullscreen_window.bind("<Motion>", self._fullscreen_motion)
         
         self.fullscreen_display = tk.Canvas(
             self.fullscreen_window,
@@ -1655,7 +2023,41 @@ class ScreenShareApp(tk.Tk):
                 fill="#F9FAFB",
                 font=("Segoe UI", 32, "bold")
             )
+        self.fullscreen_hint_id = self.fullscreen_display.create_text(
+            fs_width // 2,
+            max(36, fs_height - 48),
+            text="Esc or double-click to exit",
+            fill="#CBD5E1",
+            font=("Segoe UI", 12, "bold"),
+        )
+        self.after(2200, self._hide_fullscreen_hint)
+        self._schedule_hide_fullscreen_cursor()
         self.fullscreen_window.focus_force()
+
+    def _hide_fullscreen_hint(self):
+        if self.fullscreen_display and self.fullscreen_hint_id:
+            try:
+                self.fullscreen_display.delete(self.fullscreen_hint_id)
+            except tk.TclError:
+                pass
+            self.fullscreen_hint_id = None
+
+    def _fullscreen_motion(self, _event=None):
+        if self.fullscreen_window:
+            self.fullscreen_window.configure(cursor="")
+            self._schedule_hide_fullscreen_cursor()
+
+    def _schedule_hide_fullscreen_cursor(self):
+        if not self.fullscreen_window:
+            return
+        if self.fullscreen_cursor_job:
+            self.after_cancel(self.fullscreen_cursor_job)
+        self.fullscreen_cursor_job = self.after(1800, self._hide_fullscreen_cursor)
+
+    def _hide_fullscreen_cursor(self):
+        self.fullscreen_cursor_job = None
+        if self.fullscreen_window:
+            self.fullscreen_window.configure(cursor="none")
 
     def exit_fullscreen(self):
         if not self.fullscreen_active:
@@ -1664,6 +2066,13 @@ class ScreenShareApp(tk.Tk):
             del self.fullscreen_image_id
         if hasattr(self, "fullscreen_text_id"):
             del self.fullscreen_text_id
+        self.fullscreen_hint_id = None
+        if self.fullscreen_cursor_job:
+            try:
+                self.after_cancel(self.fullscreen_cursor_job)
+            except tk.TclError:
+                pass
+            self.fullscreen_cursor_job = None
         self.fullscreen_photo = None
         if self.fullscreen_window:
             self.fullscreen_window.destroy()
@@ -1674,6 +2083,8 @@ class ScreenShareApp(tk.Tk):
         self._rerender_current_frame()
 
     def destroy(self):
+        self._cancel_reconnect()
+        self._save_settings()
         self.exit_fullscreen()
         self.stop()
         super().destroy()
