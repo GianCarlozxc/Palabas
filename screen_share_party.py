@@ -785,7 +785,7 @@ class ScreenShareApp(tk.Tk):
 
         self.logo_mark = tk.Label(
             self.brand_frame,
-            text="● LIVE",
+            text="LIVE",
             bg="#0D342A",
             fg="#31F287",
             font=("Segoe UI", 10, "bold"),
@@ -798,7 +798,7 @@ class ScreenShareApp(tk.Tk):
         
         self.nav_frame = tk.Frame(self.header, bg=BG)
         self.nav_frame.grid(row=0, column=1, sticky="w", pady=18)
-        for label in ("Profile", "Rooms", "Session"):
+        for label, page_name in (("Profile", "name"), ("Rooms", "room"), ("Session", "session")):
             lbl = tk.Label(
                 self.nav_frame,
                 text=label,
@@ -814,6 +814,7 @@ class ScreenShareApp(tk.Tk):
                 return lambda e: l.config(fg="#C7D2E6")
             lbl.bind("<Enter>", make_hover(lbl))
             lbl.bind("<Leave>", make_leave(lbl))
+            lbl.bind("<Button-1>", lambda _event, target=page_name: self._navigate(target))
             self.nav_labels.append(lbl)
             
         self.theme_mode = tk.StringVar(value="dark")
@@ -850,14 +851,14 @@ class ScreenShareApp(tk.Tk):
         self.update_button.grid(row=0, column=4, sticky="e", padx=(12, 0), pady=18)
         self.update_button.grid_remove()
 
-        self.settings_button = self._window_control_button("SET", self.show_settings_dialog)
-        self.settings_button.configure(font=("Segoe UI", 9, "bold"), width=4)
+        self.settings_button = self._window_control_button("Settings", self.show_settings_dialog)
+        self.settings_button.configure(font=("Segoe UI", 9, "bold"), width=8)
         self.settings_button.grid(row=0, column=6, sticky="e", padx=(12, 0), pady=18)
 
         self.minimize_button = self._window_control_button("-", self._minimize_window)
         self.minimize_button.grid(row=0, column=8, sticky="e", padx=(12, 0), pady=18)
 
-        self.maximize_button = self._window_control_button("□", self._toggle_maximize)
+        self.maximize_button = self._window_control_button("[ ]", self._toggle_maximize)
         self.maximize_button.grid(row=0, column=9, sticky="e", padx=(12, 0), pady=18)
 
         self.close_button = self._window_control_button("X", self.destroy, danger=True)
@@ -879,7 +880,7 @@ class ScreenShareApp(tk.Tk):
         self.bottom_bar.pack_propagate(False)
         tk.Label(
             self.bottom_bar,
-            text="●  Connected to LAN",
+            text="Connected to LAN",
             bg="#070B15",
             fg="#31F287",
             font=("Segoe UI", 11, "bold"),
@@ -950,7 +951,7 @@ class ScreenShareApp(tk.Tk):
                 self.geometry(self.normal_geometry)
             self.maximized = False
             if hasattr(self, "maximize_button"):
-                self.maximize_button.configure(text="□")
+                self.maximize_button.configure(text="[ ]")
             return
 
         self.normal_geometry = self.geometry()
@@ -959,7 +960,7 @@ class ScreenShareApp(tk.Tk):
         self.geometry(f"{work_width}x{work_height}+0+0")
         self.maximized = True
         if hasattr(self, "maximize_button"):
-            self.maximize_button.configure(text="❐")
+            self.maximize_button.configure(text="[]")
 
     def _restore_borderless(self, _event=None):
         if self.state() == "normal":
@@ -1133,10 +1134,30 @@ class ScreenShareApp(tk.Tk):
         for frame in self.frames.values():
             frame.pack_forget()
 
+    def _navigate(self, name):
+        if name == "room" and not self.user_name.get().strip():
+            self._show_page("name")
+            self._set_status("Enter a display name first")
+            return
+        if name == "session" and not self.room_code.get().strip():
+            self._show_page("room" if self.user_name.get().strip() else "name")
+            self._set_status("Create or join a room first")
+            return
+        self._show_page(name)
+
     def _show_page(self, name):
         self.page = name
         self._clear_content()
         self.frames[name].pack(fill=tk.BOTH, expand=True)
+        for lbl in getattr(self, "nav_labels", []):
+            if not lbl.winfo_exists():
+                continue
+            active = (
+                (name == "name" and lbl.cget("text") == "Profile")
+                or (name == "room" and lbl.cget("text") == "Rooms")
+                or (name == "session" and lbl.cget("text") == "Session")
+            )
+            lbl.configure(fg=ACCENT if active else "#C7D2E6")
 
     def _button(self, parent, text, command, primary=False):
         btn = tk.Button(
@@ -1216,7 +1237,7 @@ class ScreenShareApp(tk.Tk):
 
         tk.Label(
             intro,
-            text="WATCH PARTY",
+            text="PROFILE",
             bg=BG,
             foreground=ACCENT,
             font=("Segoe UI", 11, "bold"),
@@ -1228,7 +1249,7 @@ class ScreenShareApp(tk.Tk):
 
         tk.Label(
             intro,
-            text="Share a screen.\nKeep everyone\nin sync.",
+            text="Set up your\nwatch profile.",
             bg=BG,
             fg=TEXT,
             font=("Segoe UI", 27, "bold"),
@@ -1237,7 +1258,7 @@ class ScreenShareApp(tk.Tk):
         ).grid(row=2, column=0, sticky="w")
         tk.Label(
             intro,
-            text="A lightweight LAN viewer for rooms, watch parties, and quick screen handoff.",
+            text="Choose the name people will see when you host or join a room.",
             bg=BG,
             fg="#B9C5D8",
             wraplength=400,
@@ -1307,7 +1328,8 @@ class ScreenShareApp(tk.Tk):
             font=("Segoe UI", 15),
         )
         name_entry.pack(fill=tk.X, ipady=10, padx=1, pady=1)
-        self._button(card, "CONTINUE  >", self.continue_to_rooms, primary=True).pack(fill=tk.X, ipady=4)
+        self._button(card, "CONTINUE", self.continue_to_rooms, primary=True).pack(fill=tk.X, ipady=4)
+        self._small_button(card, "SAVE PROFILE", self.save_profile).pack(fill=tk.X, pady=(10, 0))
 
         tips_header = tk.Frame(card, bg="#101624")
         tips_header.pack(fill=tk.X, pady=(22, 0))
@@ -1325,7 +1347,7 @@ class ScreenShareApp(tk.Tk):
         tip.pack(fill=tk.X, pady=(12, 0))
         tk.Label(
             tip,
-            text="Use a name others will recognize\nfor a better experience.",
+            text="Your profile is saved locally and used when hosting or watching.",
             bg="#111A2B",
             fg="#D7DEEA",
             justify=tk.LEFT,
@@ -1434,9 +1456,9 @@ class ScreenShareApp(tk.Tk):
 
         self._pill_label(join, "VIEWER").pack(anchor="w", pady=(0, 12))
         self._accent_heading(join, "Join ", "a room").pack(anchor="w", pady=(0, 14))
-        self._room_entry(join, "Host address", self.host, "▣").pack(fill=tk.X, pady=(0, 9))
-        self._room_entry(join, "Port", self.port, "▤").pack(fill=tk.X, pady=(0, 9))
-        self._room_entry(join, "Room code (optional)", self.join_code, "▢").pack(fill=tk.X, pady=(0, 12))
+        self._room_entry(join, "Host address", self.host, "Host").pack(fill=tk.X, pady=(0, 9))
+        self._room_entry(join, "Port", self.port, "Port").pack(fill=tk.X, pady=(0, 9))
+        self._room_entry(join, "Room code (optional)", self.join_code, "Code").pack(fill=tk.X, pady=(0, 12))
         self._button(join, "JOIN ROOM      ->", self.join_room, primary=True).pack(fill=tk.X, ipady=8)
 
     def _pill_label(self, parent, text):
@@ -1686,7 +1708,7 @@ class ScreenShareApp(tk.Tk):
         ).pack(fill=tk.X, pady=(0, 2))
         tk.Label(
             self.host_options,
-            text="Video only  ⓘ",
+            text="Video only",
             bg="#0B1220",
             fg="#AEBBD0",
             font=("Segoe UI", 8),
@@ -1810,6 +1832,14 @@ class ScreenShareApp(tk.Tk):
         self.status.set(f"Signed in as {name}")
         self._save_settings()
         self._show_page("room")
+
+    def save_profile(self):
+        name = self.user_name.get().strip()
+        if not name:
+            messagebox.showerror("Name required", "Enter your display name before saving.")
+            return
+        self._save_settings()
+        self._set_status(f"Profile saved: {name}")
 
     def create_room(self):
         code = secrets.token_hex(3).upper()
