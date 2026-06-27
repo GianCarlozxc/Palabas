@@ -1,5 +1,5 @@
 {
-  "version": "1.0.7",
+  "version": "1.0.9",
   "download_url": "https://github.com/GianCarlozxc/Palabas/raw/main/dist/Watch.exe",
-  "notes": "update"
+  "notes": "Rooms now open immediately so viewers can join right after creation."
 }

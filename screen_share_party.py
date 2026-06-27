@@ -20,7 +20,7 @@ import zlib
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.9"
 GITHUB_REPO = "GianCarlozxc/Palabas"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/GianCarlozxc/Palabas/main/update.json"
 DEFAULT_DOWNLOAD_URL = "https://github.com/GianCarlozxc/Palabas/raw/main/dist/Watch.exe"
@@ -1729,6 +1729,7 @@ class ScreenShareApp(tk.Tk):
             self.port.set(DEFAULT_PORT)
         self.join_code.set(str(room.get("room", "")).upper())
         self._set_status(f"Selected {room.get('host_name') or 'public room'}")
+        self.join_room(auto_start=True)
 
     def _update_room_visibility(self):
         if self.mode.get() == "share" and self.room_code.get().strip():
@@ -2093,15 +2094,16 @@ class ScreenShareApp(tk.Tk):
         self.host_options.pack(fill=tk.X, pady=(0, 12))
         self._set_display_message(self._host_waiting_text())
         self.start_button.configure(state=tk.NORMAL)
-        self.stop_button.configure(state=tk.DISABLED)
+        self.stop_button.configure(state=tk.NORMAL)
         self.pause_button.configure(state=tk.DISABLED, text="PAUSE SHARING")
         self.reconnect_button.configure(state=tk.DISABLED)
         self.auto_reconnect_check.pack_forget()
         self._save_settings()
         self._update_room_visibility()
         self._show_page("session")
+        self._open_host_room()
 
-    def join_room(self):
+    def join_room(self, auto_start=False):
         code = self.join_code.get().strip().upper()
         host = self.host.get().strip()
         self._apply_host_port()
@@ -2128,6 +2130,8 @@ class ScreenShareApp(tk.Tk):
         self.auto_reconnect_check.pack(fill=tk.X, pady=(8, 0))
         self._save_settings()
         self._show_page("session")
+        if auto_start:
+            self.start()
 
     def back_to_rooms(self):
         self.stop()
@@ -2283,15 +2287,7 @@ class ScreenShareApp(tk.Tk):
                     self.latest_frame = self._waiting_frame()
                     self.latest_packet = self.waiting_packet
                     self.latest_packet_version += 1
-            self.server = ShareServer(
-                port,
-                self.room_code.get(),
-                self._host_packet,
-                self._set_status,
-                self._handle_server_start_failed,
-                self._handle_viewers_changed,
-            )
-            self.server.start()
+            self._open_host_room(port)
             if self.selected_source_name != "Entire screen" and self.share_enabled:
                 self.after(300, self.iconify)
         else:
@@ -2306,6 +2302,31 @@ class ScreenShareApp(tk.Tk):
                 self._handle_viewer_stopped,
             )
             self.client.start()
+
+    def _open_host_room(self, port=None):
+        if self.server:
+            return
+        try:
+            if port is None:
+                self._apply_host_port()
+                port = int(self.port.get())
+        except (TypeError, ValueError):
+            self._set_status("Invalid port")
+            return
+        with self.packet_lock:
+            self.latest_frame = self._waiting_frame()
+            self.latest_packet = self.waiting_packet
+            self.latest_packet_version += 1
+        self.server = ShareServer(
+            port,
+            self.room_code.get(),
+            self._host_packet,
+            self._set_status,
+            self._handle_server_start_failed,
+            self._handle_viewers_changed,
+        )
+        self.server.start()
+        self._set_status(f"Room open on {self._local_ip()}:{port}")
 
     def _apply_host_port(self):
         host = self.host.get().strip()
