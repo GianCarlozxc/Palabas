@@ -36,6 +36,10 @@ DOWNLOAD_URLS = [
 UPDATE_CHECK_INTERVAL_MS = 5 * 60 * 1000
 FRAME_HEADER = struct.Struct("!III")
 DEFAULT_PORT = 5050
+DISCOVERY_PORT = 5051
+DISCOVERY_MAGIC = "WATCH_ROOM_V1"
+DISCOVERY_INTERVAL_SECONDS = 1.5
+DISCOVERY_ROOM_TTL_SECONDS = 5
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watch_settings.json")
 STREAM_FPS = 8
 VIEWER_RENDER_FPS = 12
@@ -624,6 +628,7 @@ class ScreenShareApp(tk.Tk):
         self.user_name = tk.StringVar()
         self.room_code = tk.StringVar()
         self.join_code = tk.StringVar()
+        self.public_room = tk.BooleanVar(value=False)
         self.host_share_screen = tk.BooleanVar(value=False)
         self.share_enabled = False
         self.share_paused = tk.BooleanVar(value=False)
@@ -658,6 +663,15 @@ class ScreenShareApp(tk.Tk):
         self.update_checking = False
         self.update_button = None
         self.settings_button = None
+        self.instance_id = secrets.token_hex(8)
+        self.discovered_rooms = {}
+        self.discovery_rows = {}
+        self.discovery_stop_event = threading.Event()
+        self.discovery_thread = None
+        self.announce_stop_event = threading.Event()
+        self.announce_thread = None
+        self.public_rooms_list = None
+        self.public_rooms_empty = None
 
         self._build_ui()
         self._load_settings()
@@ -665,7 +679,9 @@ class ScreenShareApp(tk.Tk):
         self.bind("<Map>", self._restore_borderless)
         self.bind("<Configure>", self._sync_responsive_layout)
         self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self._start_discovery_listener()
         self._schedule_preview()
+        self._schedule_room_cleanup()
         self.after(1500, self.check_for_updates)
 
     def _build_ui(self):
@@ -1506,6 +1522,7 @@ class ScreenShareApp(tk.Tk):
         shell.columnconfigure(0, weight=1)
         shell.columnconfigure(1, weight=1)
         shell.rowconfigure(2, weight=1)
+        shell.rowconfigure(3, weight=0)
 
         title = tk.Frame(shell, bg=BG)
         title.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
@@ -1553,6 +1570,21 @@ class ScreenShareApp(tk.Tk):
             justify=tk.LEFT,
             font=("Segoe UI", 11),
         ).pack(anchor="w", pady=(10, 0))
+        tk.Checkbutton(
+            create,
+            text="Show this room in the lobby",
+            variable=self.public_room,
+            command=self._update_room_visibility,
+            bg="#0B1220",
+            activebackground="#0B1220",
+            fg="#C7D2E6",
+            activeforeground=TEXT,
+            selectcolor="#07111E",
+            font=("Segoe UI", 10, "bold"),
+            relief=tk.FLAT,
+            bd=0,
+            cursor="hand2",
+        ).pack(anchor="w", pady=(12, 0))
 
         art = tk.Canvas(create, width=430, height=184, bg="#0B1220", highlightthickness=0, bd=0)
         art.pack(fill=tk.X, expand=True, pady=(6, 8))
@@ -1580,6 +1612,31 @@ class ScreenShareApp(tk.Tk):
         self._room_entry(join, "Port", self.port, "Port").pack(fill=tk.X, pady=(0, 9))
         self._room_entry(join, "Room code (optional)", self.join_code, "Code").pack(fill=tk.X, pady=(0, 12))
         self._button(join, "JOIN ROOM      ->", self.join_room, primary=True).pack(fill=tk.X, ipady=8)
+
+        lobby_border = tk.Frame(shell, bg="#263148", padx=1, pady=1)
+        lobby_border.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        lobby = tk.Frame(lobby_border, bg="#0B1220", padx=24, pady=16)
+        lobby.pack(fill=tk.BOTH, expand=True)
+        header = tk.Frame(lobby, bg="#0B1220")
+        header.pack(fill=tk.X)
+        tk.Label(
+            header,
+            text="PUBLIC ROOMS",
+            bg="#0B1220",
+            fg=ACCENT,
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side=tk.LEFT)
+        self._button(header, "REFRESH", self._refresh_public_rooms).pack(side=tk.RIGHT)
+        self.public_rooms_list = tk.Frame(lobby, bg="#0B1220")
+        self.public_rooms_list.pack(fill=tk.X, pady=(12, 0))
+        self.public_rooms_empty = tk.Label(
+            self.public_rooms_list,
+            text="No public rooms found on this LAN yet.",
+            bg="#0B1220",
+            fg="#94A3B8",
+            font=("Segoe UI", 10),
+        )
+        self.public_rooms_empty.pack(anchor="w")
 
     def _pill_label(self, parent, text):
         return tk.Label(
@@ -1623,6 +1680,65 @@ class ScreenShareApp(tk.Tk):
             font=("Segoe UI", 12),
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=8)
         return wrapper
+
+    def _refresh_public_rooms(self):
+        self._render_public_rooms()
+        self._set_status("Looking for public rooms on LAN")
+
+    def _render_public_rooms(self):
+        if not self.public_rooms_list or not self.public_rooms_list.winfo_exists():
+            return
+        now = time.monotonic()
+        for key, room in list(self.discovered_rooms.items()):
+            if now - room.get("seen", 0) > DISCOVERY_ROOM_TTL_SECONDS:
+                self.discovered_rooms.pop(key, None)
+        for child in self.public_rooms_list.winfo_children():
+            child.destroy()
+        rooms = sorted(self.discovered_rooms.values(), key=lambda item: (item.get("host_name", ""), item.get("room", "")))
+        if not rooms:
+            self.public_rooms_empty = tk.Label(
+                self.public_rooms_list,
+                text="No public rooms found on this LAN yet.",
+                bg="#0B1220",
+                fg="#94A3B8",
+                font=("Segoe UI", 10),
+            )
+            self.public_rooms_empty.pack(anchor="w")
+            return
+        for room in rooms:
+            self._public_room_row(self.public_rooms_list, room).pack(fill=tk.X, pady=(0, 8))
+
+    def _public_room_row(self, parent, room):
+        row = tk.Frame(parent, bg="#111A2B", highlightbackground="#263148", highlightthickness=1, padx=14, pady=10)
+        left = tk.Frame(row, bg="#111A2B")
+        left.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        title = f"{room.get('host_name') or 'Host'}'s room"
+        tk.Label(left, text=title, bg="#111A2B", fg=TEXT, font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        details = f"{room.get('host')}:{room.get('port')}  /  {room.get('room')}"
+        tk.Label(left, text=details, bg="#111A2B", fg="#AEBBD0", font=("Segoe UI", 9)).pack(anchor="w", pady=(3, 0))
+        self._button(row, "JOIN", lambda selected=room: self._select_public_room(selected), primary=True).pack(side=tk.RIGHT, padx=(12, 0))
+        row.bind("<Button-1>", lambda _event, selected=room: self._select_public_room(selected))
+        left.bind("<Button-1>", lambda _event, selected=room: self._select_public_room(selected))
+        return row
+
+    def _select_public_room(self, room):
+        self.host.set(str(room.get("host", "")))
+        try:
+            self.port.set(int(room.get("port", DEFAULT_PORT)))
+        except (TypeError, ValueError, tk.TclError):
+            self.port.set(DEFAULT_PORT)
+        self.join_code.set(str(room.get("room", "")).upper())
+        self._set_status(f"Selected {room.get('host_name') or 'public room'}")
+
+    def _update_room_visibility(self):
+        if self.mode.get() == "share" and self.room_code.get().strip():
+            if self.public_room.get():
+                self._start_room_announcer()
+                self._set_status("Room is public in the lobby")
+            else:
+                self._stop_room_announcer()
+                self._set_status("Room is private")
+        self._save_settings()
 
     def _display_resized(self, _event=None):
         if self.current_rgb_frame:
@@ -1982,6 +2098,7 @@ class ScreenShareApp(tk.Tk):
         self.reconnect_button.configure(state=tk.DISABLED)
         self.auto_reconnect_check.pack_forget()
         self._save_settings()
+        self._update_room_visibility()
         self._show_page("session")
 
     def join_room(self):
@@ -1995,6 +2112,7 @@ class ScreenShareApp(tk.Tk):
         if not self._valid_host(host):
             messagebox.showerror("Invalid host", "Enter a valid host name or IP address.")
             return
+        self._stop_room_announcer()
         self.room_code.set(code)
         self.mode.set("watch")
         self.session_title.configure(text="Watch Screen")
@@ -2013,6 +2131,7 @@ class ScreenShareApp(tk.Tk):
 
     def back_to_rooms(self):
         self.stop()
+        self._stop_room_announcer()
         self.photo = None
         self._set_display_message("No active stream")
         self._save_settings()
@@ -2030,6 +2149,106 @@ class ScreenShareApp(tk.Tk):
                 sock.close()
             except Exception:
                 pass
+
+    def _start_discovery_listener(self):
+        if self.discovery_thread and self.discovery_thread.is_alive():
+            return
+        self.discovery_stop_event.clear()
+        self.discovery_thread = threading.Thread(target=self._discovery_loop, daemon=True)
+        self.discovery_thread.start()
+
+    def _discovery_loop(self):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("", DISCOVERY_PORT))
+            listener.settimeout(0.5)
+            while not self.discovery_stop_event.is_set():
+                try:
+                    data, addr = listener.recvfrom(4096)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                self._handle_room_announcement(data, addr)
+        except OSError as exc:
+            self._set_status(f"Lobby discovery unavailable: {exc}")
+        finally:
+            try:
+                listener.close()
+            except OSError:
+                pass
+
+    def _handle_room_announcement(self, data, addr):
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return
+        if payload.get("magic") != DISCOVERY_MAGIC:
+            return
+        if payload.get("instance") == self.instance_id:
+            return
+        room_code = str(payload.get("room", "")).upper().strip()
+        if not room_code:
+            return
+        host = str(payload.get("host") or addr[0]).strip()
+        try:
+            port = int(payload.get("port", DEFAULT_PORT))
+        except (TypeError, ValueError):
+            port = DEFAULT_PORT
+        key = f"{host}:{port}:{room_code}"
+        self.discovered_rooms[key] = {
+            "host": host,
+            "port": port,
+            "room": room_code,
+            "host_name": str(payload.get("host_name", "Host")).strip() or "Host",
+            "seen": time.monotonic(),
+        }
+        self.after(0, self._render_public_rooms)
+
+    def _start_room_announcer(self):
+        if self.announce_thread and self.announce_thread.is_alive():
+            if not self.announce_stop_event.is_set():
+                return
+            self.announce_thread.join(timeout=0.2)
+        if self.announce_thread and self.announce_thread.is_alive():
+            return
+        self.announce_stop_event.clear()
+        self.announce_thread = threading.Thread(target=self._announcement_loop, daemon=True)
+        self.announce_thread.start()
+
+    def _stop_room_announcer(self):
+        self.announce_stop_event.set()
+
+    def _announcement_loop(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            while not self.announce_stop_event.is_set():
+                if self.public_room.get() and self.mode.get() == "share" and self.room_code.get().strip():
+                    payload = {
+                        "magic": DISCOVERY_MAGIC,
+                        "instance": self.instance_id,
+                        "room": self.room_code.get().strip().upper(),
+                        "host": self._local_ip(),
+                        "port": int(self.port.get() or DEFAULT_PORT),
+                        "host_name": self.user_name.get().strip() or "Host",
+                        "version": APP_VERSION,
+                    }
+                    try:
+                        sock.sendto(json.dumps(payload).encode("utf-8"), ("255.255.255.255", DISCOVERY_PORT))
+                    except OSError:
+                        pass
+                self.announce_stop_event.wait(DISCOVERY_INTERVAL_SECONDS)
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _schedule_room_cleanup(self):
+        self._render_public_rooms()
+        self.after(2000, self._schedule_room_cleanup)
 
     def start(self):
         try:
@@ -2534,6 +2753,7 @@ class ScreenShareApp(tk.Tk):
             self.quality_profile.set("Balanced" if quality == "High" else quality)
         self.mode.set(settings.get("last_mode", self.mode.get()) if settings.get("last_mode") in ("share", "watch") else self.mode.get())
         self.auto_reconnect_enabled.set(bool(settings.get("auto_reconnect", True)))
+        self.public_room.set(bool(settings.get("public_room", False)))
 
     def _save_settings(self):
         settings = {
@@ -2543,6 +2763,7 @@ class ScreenShareApp(tk.Tk):
             "quality": self.quality_profile.get(),
             "last_mode": self.mode.get(),
             "auto_reconnect": self.auto_reconnect_enabled.get(),
+            "public_room": self.public_room.get(),
         }
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as settings_file:
@@ -2936,6 +3157,8 @@ class ScreenShareApp(tk.Tk):
 
     def destroy(self):
         self._cancel_reconnect()
+        self.discovery_stop_event.set()
+        self._stop_room_announcer()
         self._save_settings()
         self.exit_fullscreen()
         self.stop()
