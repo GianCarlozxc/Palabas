@@ -1007,6 +1007,106 @@ class ScreenShareApp(tk.Tk):
             self.theme_toggle_btn.create_oval(20, 14, 38, 32, fill=fg, outline=fg)
             self.theme_toggle_btn.create_oval(28, 10, 45, 28, fill=bg, outline=bg)
 
+    def _theme_palette(self):
+        if self.theme_mode.get() == "dark":
+            return {
+                "bg": DARK_BG,
+                "chrome": "#070B15",
+                "panel": DARK_PANEL,
+                "panel_2": DARK_PANEL_2,
+                "surface": DARK_SURFACE,
+                "input": DARK_INPUT,
+                "text": DARK_TEXT,
+                "muted": DARK_MUTED,
+                "border": DARK_BORDER,
+                "danger": "#7F1D1D",
+                "danger_hover": "#991B1B",
+            }
+        return {
+            "bg": LIGHT_BG,
+            "chrome": "#FFFFFF",
+            "panel": LIGHT_PANEL,
+            "panel_2": "#E9EEF6",
+            "surface": "#D9E1EC",
+            "input": "#FFFFFF",
+            "text": LIGHT_TEXT,
+            "muted": LIGHT_MUTED,
+            "border": LIGHT_BORDER,
+            "danger": "#B91C1C",
+            "danger_hover": "#991B1B",
+        }
+
+    def _theme_widget_tree(self, widget, palette):
+        try:
+            widget_class = widget.winfo_class()
+        except tk.TclError:
+            return
+
+        if isinstance(widget, (tk.Frame, tk.LabelFrame)):
+            current = str(widget.cget("bg"))
+            if current in ("#0D342A", "#14532D"):
+                widget.configure(bg="#DCFCE7" if self.theme_mode.get() == "light" else "#0D342A")
+            elif current in ("#7F1D1D", "#991B1B", "#B91C1C"):
+                widget.configure(bg=palette["danger"])
+            elif current in ("#070B15",):
+                widget.configure(bg=palette["chrome"])
+            elif current in ("#101624", "#0B1220", "#111A2B", "#101827", "#0E1525", "#0B1020"):
+                widget.configure(bg=palette["panel"])
+            else:
+                widget.configure(bg=palette["bg"])
+            try:
+                widget.configure(highlightbackground=palette["border"])
+            except tk.TclError:
+                pass
+
+        elif isinstance(widget, tk.Label):
+            current_bg = str(widget.cget("bg"))
+            current_fg = str(widget.cget("fg"))
+            if current_bg in ("#0D342A", "#14532D"):
+                widget.configure(bg="#DCFCE7" if self.theme_mode.get() == "light" else "#0D342A")
+            elif current_bg in ("#070B15",):
+                widget.configure(bg=palette["chrome"])
+            elif current_bg in ("#101624", "#0B1220", "#111A2B", "#101827", "#0E1525", "#0B1020"):
+                widget.configure(bg=palette["panel"])
+            else:
+                widget.configure(bg=palette["bg"])
+            if current_fg.lower() not in (ACCENT.lower(), "#31f287", "#4ade80"):
+                widget.configure(fg=palette["muted"] if current_fg.lower() in ("#94a3b8", "#aebbd0", "#b9c5d8", "#c7d2e6", "#64748b") else palette["text"])
+
+        elif isinstance(widget, tk.Button):
+            text = widget.cget("text")
+            if text == "X":
+                widget.configure(bg=palette["danger"], activebackground=palette["danger_hover"], fg="#FFFFFF", activeforeground="#FFFFFF")
+            elif text.startswith("Update"):
+                widget.configure(bg="#DCFCE7" if self.theme_mode.get() == "light" else "#0D342A", activebackground="#BBF7D0" if self.theme_mode.get() == "light" else "#14532D", fg="#166534" if self.theme_mode.get() == "light" else "#31F287")
+            elif text in ("CONTINUE", "CREATE ROOM      ->", "JOIN ROOM      ->", ">  START", "UPDATE NOW"):
+                widget.configure(bg=ACCENT, activebackground=ACCENT_HOVER, fg="#FFFFFF", activeforeground="#FFFFFF")
+            else:
+                widget.configure(bg=palette["surface"], activebackground=palette["border"], fg=palette["text"], activeforeground=palette["text"])
+
+        elif isinstance(widget, tk.Entry):
+            try:
+                widget.configure(bg=palette["input"], fg=palette["text"], insertbackground=palette["text"])
+            except tk.TclError:
+                pass
+
+        elif isinstance(widget, tk.Checkbutton):
+            parent_bg = palette["panel"]
+            try:
+                widget.configure(bg=parent_bg, activebackground=parent_bg, fg=palette["text"], activeforeground=palette["text"], selectcolor=palette["input"])
+            except tk.TclError:
+                pass
+
+        elif isinstance(widget, tk.Canvas):
+            current = str(widget.cget("bg"))
+            try:
+                widget.configure(bg=palette["chrome"] if current == "#070B15" else palette["bg"])
+            except tk.TclError:
+                pass
+
+        for child in widget.winfo_children():
+            self._theme_widget_tree(child, palette)
+
     def _apply_theme(self):
         is_dark = (self.theme_mode.get() == "dark")
         bg = DARK_BG if is_dark else LIGHT_BG
@@ -1089,6 +1189,11 @@ class ScreenShareApp(tk.Tk):
         )
         
         self.configure(bg=BG)
+        palette = self._theme_palette()
+        if hasattr(self, "shell_border") and self.shell_border.winfo_exists():
+            self.shell_border.configure(bg=palette["border"])
+        if hasattr(self, "root") and self.root.winfo_exists():
+            self._theme_widget_tree(self.root, palette)
         
         if hasattr(self, "header") and self.header.winfo_exists():
             self.header.configure(bg=BG)
@@ -1108,6 +1213,11 @@ class ScreenShareApp(tk.Tk):
             self.status_label.configure(bg=PANEL_2, fg=TEXT)
         if hasattr(self, "theme_toggle_btn") and self.theme_toggle_btn.winfo_exists():
             self._draw_theme_icon()
+        if hasattr(self, "logo_icon") and self.logo_icon.winfo_exists():
+            self.logo_icon.configure(bg=palette["chrome"])
+            self.logo_icon.delete("all")
+            self.logo_icon.create_rectangle(3, 3, 39, 33, outline=ACCENT, width=2)
+            self.logo_icon.create_polygon(17, 12, 17, 24, 27, 18, fill=palette["text"], outline=palette["text"])
         if hasattr(self, "minimize_button") and self.minimize_button.winfo_exists():
             self.minimize_button.configure(bg=SURFACE, activebackground=BORDER, fg=TEXT, activeforeground=TEXT)
         if hasattr(self, "settings_button") and self.settings_button and self.settings_button.winfo_exists():
