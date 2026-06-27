@@ -39,6 +39,15 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pyinstaller
 
+      - name: Validate public update token
+        shell: pwsh
+        env:
+          UPDATE_REPO_TOKEN: ${{ secrets.UPDATE_REPO_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:UPDATE_REPO_TOKEN)) {
+            throw "Missing repository secret UPDATE_REPO_TOKEN. Create a fine-grained GitHub token with Contents: Read and write access to ${{ env.PUBLIC_UPDATE_REPO }}, then add it in this private repo under Settings > Secrets and variables > Actions."
+          }
+
       - name: Update version files
         shell: pwsh
         run: |
