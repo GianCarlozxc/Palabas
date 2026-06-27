@@ -1,5 +1,5 @@
 {
-  "version": "1.0.10",
+  "version": "1.0.11",
   "download_url": "https://github.com/GianCarlozxc/Palabas/raw/main/dist/Watch.exe",
-  "notes": "update socket"
+  "notes": "Fix update checking so the app reads GitHub update.json correctly."
 }
