@@ -20,7 +20,7 @@ import zlib
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/GianCarlozxc/Palabas/main/update.json"
 DEFAULT_DOWNLOAD_URL = "https://github.com/GianCarlozxc/Palabas/raw/main/dist/Watch.exe"
 UPDATE_CHECK_INTERVAL_MS = 5 * 60 * 1000
@@ -2793,5 +2793,6 @@ class ScreenShareApp(tk.Tk):
 if __name__ == "__main__":
     app = ScreenShareApp()
     app.mainloop()
+
 
 
