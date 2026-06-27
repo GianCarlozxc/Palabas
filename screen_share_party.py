@@ -21,17 +21,17 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 
 APP_VERSION = "1.0.6"
-GITHUB_REPO = "GianCarlozxc/Palabas"
-UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/GianCarlozxc/Palabas/main/update.json"
-DEFAULT_DOWNLOAD_URL = "https://github.com/GianCarlozxc/Palabas/raw/main/dist/Watch.exe"
+GITHUB_REPO = "GianCarlozxc/Palabas-updates"
+UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/GianCarlozxc/Palabas-updates/main/update.json"
+DEFAULT_DOWNLOAD_URL = "https://github.com/GianCarlozxc/Palabas-updates/raw/main/Watch.exe"
 UPDATE_MANIFEST_URLS = [
     UPDATE_MANIFEST_URL,
     f"https://api.github.com/repos/{GITHUB_REPO}/contents/update.json?ref=main",
 ]
 DOWNLOAD_URLS = [
     DEFAULT_DOWNLOAD_URL,
-    f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/dist/Watch.exe",
-    f"https://api.github.com/repos/{GITHUB_REPO}/contents/dist/Watch.exe?ref=main",
+    f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/Watch.exe",
+    f"https://api.github.com/repos/{GITHUB_REPO}/contents/Watch.exe?ref=main",
 ]
 UPDATE_CHECK_INTERVAL_MS = 5 * 60 * 1000
 FRAME_HEADER = struct.Struct("!III")
@@ -2514,7 +2514,7 @@ class ScreenShareApp(tk.Tk):
         except (OSError, RuntimeError, ValueError, urllib.error.URLError):
             check_failed = True
             if manual and status_widget:
-                self.after(0, status_widget.configure, {"text": "Could not read update.json. Make the GitHub repo public, then try again."})
+                self.after(0, status_widget.configure, {"text": "Could not read public update.json. Check the public update repo."})
             if manual and update_widget and not self.update_info:
                 self.after(0, update_widget.configure, {"state": tk.DISABLED})
         finally:

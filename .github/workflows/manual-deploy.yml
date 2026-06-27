@@ -16,6 +16,9 @@ on:
 permissions:
   contents: write
 
+env:
+  PUBLIC_UPDATE_REPO: GianCarlozxc/Palabas-updates
+
 jobs:
   build-and-publish:
     runs-on: windows-latest
@@ -50,7 +53,7 @@ jobs:
 
           $manifest = [ordered]@{
             version = $version
-            download_url = "https://github.com/${{ github.repository }}/raw/main/dist/Watch.exe"
+            download_url = "https://github.com/${{ env.PUBLIC_UPDATE_REPO }}/raw/main/Watch.exe"
             notes = "${{ inputs.notes }}"
           }
           $manifest | ConvertTo-Json | Set-Content update.json -Encoding UTF8
@@ -66,3 +69,26 @@ jobs:
           git add screen_share_party.py update.json dist/Watch.exe
           git commit -m "Deploy Watch ${{ inputs.version }}"
           git push
+
+      - name: Checkout public update repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PUBLIC_UPDATE_REPO }}
+          token: ${{ secrets.UPDATE_REPO_TOKEN }}
+          path: public-update
+
+      - name: Publish public update files
+        shell: pwsh
+        run: |
+          Copy-Item dist/Watch.exe public-update/Watch.exe -Force
+          Copy-Item update.json public-update/update.json -Force
+
+          Push-Location public-update
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Watch.exe update.json
+          if (-not (git diff --cached --quiet)) {
+            git commit -m "Publish Watch ${{ inputs.version }}"
+            git push
+          }
+          Pop-Location
