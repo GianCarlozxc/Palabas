@@ -21,8 +21,18 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 
 APP_VERSION = "1.0.4"
+GITHUB_REPO = "GianCarlozxc/Palabas"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/GianCarlozxc/Palabas/main/update.json"
 DEFAULT_DOWNLOAD_URL = "https://github.com/GianCarlozxc/Palabas/raw/main/dist/Watch.exe"
+UPDATE_MANIFEST_URLS = [
+    UPDATE_MANIFEST_URL,
+    f"https://api.github.com/repos/{GITHUB_REPO}/contents/update.json?ref=main",
+]
+DOWNLOAD_URLS = [
+    DEFAULT_DOWNLOAD_URL,
+    f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/dist/Watch.exe",
+    f"https://api.github.com/repos/{GITHUB_REPO}/contents/dist/Watch.exe?ref=main",
+]
 UPDATE_CHECK_INTERVAL_MS = 5 * 60 * 1000
 FRAME_HEADER = struct.Struct("!III")
 DEFAULT_PORT = 5050
@@ -2229,6 +2239,23 @@ class ScreenShareApp(tk.Tk):
             parts.append(0)
         return tuple(parts[:3])
 
+    def _github_request(self, url, raw=False, timeout=10):
+        headers = {"User-Agent": f"Watch/{APP_VERSION}"}
+        if raw:
+            headers["Accept"] = "application/vnd.github.raw"
+        return urllib.request.Request(url, headers=headers)
+
+    def _read_update_manifest(self):
+        last_error = None
+        for index, url in enumerate(UPDATE_MANIFEST_URLS):
+            try:
+                request = self._github_request(url, raw=index > 0, timeout=8)
+                with urllib.request.urlopen(request, timeout=8) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError(last_error or "Could not read update manifest")
+
     def check_for_updates(self, manual=False, status_widget=None, update_widget=None):
         if self.update_info:
             if status_widget and status_widget.winfo_exists():
@@ -2251,12 +2278,7 @@ class ScreenShareApp(tk.Tk):
         found_update = False
         check_failed = False
         try:
-            request = urllib.request.Request(
-                UPDATE_MANIFEST_URL,
-                headers={"User-Agent": f"Watch/{APP_VERSION}"},
-            )
-            with urllib.request.urlopen(request, timeout=6) as response:
-                manifest = json.loads(response.read().decode("utf-8"))
+            manifest = self._read_update_manifest()
             latest = str(manifest.get("version", "")).strip()
             if latest and self._version_tuple(latest) > self._version_tuple(APP_VERSION):
                 self.update_info = {
@@ -2270,14 +2292,18 @@ class ScreenShareApp(tk.Tk):
                     self.after(0, status_widget.configure, {"text": f"Update {latest} is available."})
                 if update_widget:
                     self.after(0, update_widget.configure, {"state": tk.NORMAL})
-        except (OSError, ValueError, urllib.error.URLError):
+        except (OSError, RuntimeError, ValueError, urllib.error.URLError):
             check_failed = True
             if manual and status_widget:
-                self.after(0, status_widget.configure, {"text": "Could not check for updates. Check your internet connection."})
+                self.after(0, status_widget.configure, {"text": "Could not read update.json. Make the GitHub repo public, then try again."})
+            if manual and update_widget and not self.update_info:
+                self.after(0, update_widget.configure, {"state": tk.DISABLED})
         finally:
             self.update_checking = False
             if manual and not found_update and not check_failed and status_widget:
                 self.after(0, status_widget.configure, {"text": f"You are up to date. Version {APP_VERSION}."})
+                if update_widget and not self.update_info:
+                    self.after(0, update_widget.configure, {"state": tk.DISABLED})
             if not found_update:
                 try:
                     self.after(UPDATE_CHECK_INTERVAL_MS, self.check_for_updates)
@@ -2416,27 +2442,43 @@ class ScreenShareApp(tk.Tk):
 
     def _download_update_worker(self, dialog, progress, status_label):
         try:
-            url = self.update_info.get("download_url") or DEFAULT_DOWNLOAD_URL
             target = os.path.join(tempfile.gettempdir(), "Watch-update.exe")
-            request = urllib.request.Request(url, headers={"User-Agent": f"Watch/{APP_VERSION}"})
-            with urllib.request.urlopen(request, timeout=15) as response, open(target, "wb") as output:
-                total = int(response.headers.get("Content-Length") or 0)
-                downloaded = 0
-                while True:
-                    chunk = response.read(1024 * 128)
-                    if not chunk:
-                        break
-                    output.write(chunk)
-                    downloaded += len(chunk)
-                    if total:
-                        percent = min(100, int(downloaded * 100 / total))
-                        self.after(0, progress.configure, {"value": percent})
-                        self.after(0, status_label.configure, {"text": f"Downloading update... {percent}%"})
-                    else:
-                        self.after(0, status_label.configure, {"text": f"Downloaded {downloaded // 1024} KB"})
+            urls = []
+            if self.update_info.get("download_url"):
+                urls.append(self.update_info["download_url"])
+            urls.extend(url for url in DOWNLOAD_URLS if url not in urls)
+            self._download_update_file(urls, target, progress, status_label)
             self.after(0, self._finish_update, dialog, status_label, target)
         except Exception as exc:
             self.after(0, status_label.configure, {"text": f"Update failed: {exc}"})
+
+    def _download_update_file(self, urls, target, progress, status_label):
+        last_error = None
+        for url in urls:
+            try:
+                is_api_raw = "api.github.com" in url
+                request = self._github_request(url, raw=is_api_raw, timeout=20)
+                with urllib.request.urlopen(request, timeout=20) as response, open(target, "wb") as output:
+                    total = int(response.headers.get("Content-Length") or 0)
+                    downloaded = 0
+                    while True:
+                        chunk = response.read(1024 * 128)
+                        if not chunk:
+                            break
+                        output.write(chunk)
+                        downloaded += len(chunk)
+                        if total:
+                            percent = min(100, int(downloaded * 100 / total))
+                            self.after(0, progress.configure, {"value": percent})
+                            self.after(0, status_label.configure, {"text": f"Downloading update... {percent}%"})
+                        else:
+                            self.after(0, status_label.configure, {"text": f"Downloaded {downloaded // 1024} KB"})
+                if os.path.getsize(target) > 1024 * 1024:
+                    return
+                last_error = RuntimeError("Downloaded file is too small")
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError(last_error or "Could not download update")
 
     def _finish_update(self, dialog, status_label, downloaded_exe):
         status_label.configure(text="Download complete. Restarting...")
