@@ -645,7 +645,9 @@ class ScreenShareApp(tk.Tk):
         self.session_body = None
         self.controls_border = None
         self.update_info = None
+        self.update_checking = False
         self.update_button = None
+        self.settings_button = None
 
         self._build_ui()
         self._load_settings()
@@ -748,6 +750,7 @@ class ScreenShareApp(tk.Tk):
         self.header.columnconfigure(7, weight=0)
         self.header.columnconfigure(8, weight=0)
         self.header.columnconfigure(9, weight=0)
+        self.header.columnconfigure(10, weight=0)
         self.header.bind("<ButtonPress-1>", self._start_window_drag)
         self.header.bind("<B1-Motion>", self._drag_window)
 
@@ -823,7 +826,7 @@ class ScreenShareApp(tk.Tk):
             highlightthickness=0,
             bd=0,
         )
-        self.theme_toggle_btn.grid(row=0, column=6, sticky="e", padx=(16, 0), pady=18)
+        self.theme_toggle_btn.grid(row=0, column=7, sticky="e", padx=(12, 0), pady=18)
         self.theme_toggle_btn.bind("<Button-1>", lambda _event: self.toggle_theme())
         self.theme_toggle_btn.bind("<Enter>", lambda _event: self._draw_theme_icon(hover=True))
         self.theme_toggle_btn.bind("<Leave>", lambda _event: self._draw_theme_icon(hover=False))
@@ -847,14 +850,18 @@ class ScreenShareApp(tk.Tk):
         self.update_button.grid(row=0, column=4, sticky="e", padx=(12, 0), pady=18)
         self.update_button.grid_remove()
 
+        self.settings_button = self._window_control_button("SET", self.show_settings_dialog)
+        self.settings_button.configure(font=("Segoe UI", 9, "bold"), width=4)
+        self.settings_button.grid(row=0, column=6, sticky="e", padx=(12, 0), pady=18)
+
         self.minimize_button = self._window_control_button("-", self._minimize_window)
-        self.minimize_button.grid(row=0, column=7, sticky="e", padx=(12, 0), pady=18)
+        self.minimize_button.grid(row=0, column=8, sticky="e", padx=(12, 0), pady=18)
 
         self.maximize_button = self._window_control_button("□", self._toggle_maximize)
-        self.maximize_button.grid(row=0, column=8, sticky="e", padx=(12, 0), pady=18)
+        self.maximize_button.grid(row=0, column=9, sticky="e", padx=(12, 0), pady=18)
 
         self.close_button = self._window_control_button("X", self.destroy, danger=True)
-        self.close_button.grid(row=0, column=9, sticky="e", padx=(12, 28), pady=18)
+        self.close_button.grid(row=0, column=10, sticky="e", padx=(12, 28), pady=18)
         
         self.status_label = tk.Label(
             self.header,
@@ -1102,6 +1109,8 @@ class ScreenShareApp(tk.Tk):
             self._draw_theme_icon()
         if hasattr(self, "minimize_button") and self.minimize_button.winfo_exists():
             self.minimize_button.configure(bg=SURFACE, activebackground=BORDER, fg=TEXT, activeforeground=TEXT)
+        if hasattr(self, "settings_button") and self.settings_button and self.settings_button.winfo_exists():
+            self.settings_button.configure(bg=SURFACE, activebackground=BORDER, fg=TEXT, activeforeground=TEXT)
         if hasattr(self, "close_button") and self.close_button.winfo_exists():
             self.close_button.configure(bg="#7F1D1D", activebackground="#991B1B", fg=TEXT, activeforeground=TEXT)
         if hasattr(self, "update_button") and self.update_button and self.update_button.winfo_exists():
@@ -2080,13 +2089,27 @@ class ScreenShareApp(tk.Tk):
             parts.append(0)
         return tuple(parts[:3])
 
-    def check_for_updates(self):
+    def check_for_updates(self, manual=False, status_widget=None, update_widget=None):
         if self.update_info:
+            if status_widget and status_widget.winfo_exists():
+                status_widget.configure(text=f"Update {self.update_info['version']} is available.")
+            if update_widget and update_widget.winfo_exists():
+                update_widget.configure(state=tk.NORMAL)
             return
-        threading.Thread(target=self._check_for_updates_worker, daemon=True).start()
+        if self.update_checking:
+            return
+        self.update_checking = True
+        if status_widget and status_widget.winfo_exists():
+            status_widget.configure(text="Checking GitHub for updates...")
+        threading.Thread(
+            target=self._check_for_updates_worker,
+            args=(manual, status_widget, update_widget),
+            daemon=True,
+        ).start()
 
-    def _check_for_updates_worker(self):
+    def _check_for_updates_worker(self, manual=False, status_widget=None, update_widget=None):
         found_update = False
+        check_failed = False
         try:
             request = urllib.request.Request(
                 UPDATE_MANIFEST_URL,
@@ -2103,9 +2126,18 @@ class ScreenShareApp(tk.Tk):
                 }
                 found_update = True
                 self.after(0, self._show_update_available)
+                if status_widget:
+                    self.after(0, status_widget.configure, {"text": f"Update {latest} is available."})
+                if update_widget:
+                    self.after(0, update_widget.configure, {"state": tk.NORMAL})
         except (OSError, ValueError, urllib.error.URLError):
-            pass
+            check_failed = True
+            if manual and status_widget:
+                self.after(0, status_widget.configure, {"text": "Could not check for updates. Check your internet connection."})
         finally:
+            self.update_checking = False
+            if manual and not found_update and not check_failed and status_widget:
+                self.after(0, status_widget.configure, {"text": f"You are up to date. Version {APP_VERSION}."})
             if not found_update:
                 try:
                     self.after(UPDATE_CHECK_INTERVAL_MS, self.check_for_updates)
@@ -2117,6 +2149,70 @@ class ScreenShareApp(tk.Tk):
             self.update_button.configure(text=f"Update {self.update_info['version']}")
             self.update_button.grid()
         self._set_status(f"Update {self.update_info['version']} available")
+
+    def show_settings_dialog(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("Settings")
+        dialog.configure(bg=PANEL)
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        tk.Label(
+            dialog,
+            text="Settings",
+            bg=PANEL,
+            fg=TEXT,
+            font=("Segoe UI", 18, "bold"),
+        ).pack(anchor="w", padx=24, pady=(22, 8))
+        tk.Label(
+            dialog,
+            text=f"Current version: {APP_VERSION}",
+            bg=PANEL,
+            fg=MUTED,
+            font=("Segoe UI", 10),
+        ).pack(anchor="w", padx=24, pady=(0, 18))
+
+        update_card = tk.Frame(dialog, bg=PANEL_2, highlightbackground=BORDER, highlightthickness=1, padx=18, pady=16)
+        update_card.pack(fill=tk.X, padx=24, pady=(0, 18))
+        tk.Label(
+            update_card,
+            text="Updates",
+            bg=PANEL_2,
+            fg=TEXT,
+            font=("Segoe UI", 13, "bold"),
+        ).pack(anchor="w")
+        status_text = "Update available." if self.update_info else "Check GitHub for a newer version."
+        settings_status = tk.Label(
+            update_card,
+            text=status_text,
+            bg=PANEL_2,
+            fg=MUTED,
+            justify=tk.LEFT,
+            wraplength=390,
+            font=("Segoe UI", 9),
+        )
+        settings_status.pack(anchor="w", pady=(6, 14))
+
+        buttons = tk.Frame(update_card, bg=PANEL_2)
+        buttons.pack(fill=tk.X)
+        update_now = self._button(buttons, "UPDATE NOW", lambda: (dialog.destroy(), self.show_update_dialog()), primary=True)
+        update_now.configure(state=tk.NORMAL if self.update_info else tk.DISABLED)
+        update_now.pack(side=tk.RIGHT)
+        check_button = self._small_button(
+            buttons,
+            "CHECK FOR UPDATES",
+            lambda: self.check_for_updates(manual=True, status_widget=settings_status, update_widget=update_now),
+        )
+        check_button.pack(side=tk.RIGHT, padx=(0, 10))
+
+        close_button = self._small_button(dialog, "CLOSE", dialog.destroy)
+        close_button.pack(anchor="e", padx=24, pady=(0, 22))
+
+        dialog.update_idletasks()
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - dialog.winfo_width()) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - dialog.winfo_height()) // 2)
+        dialog.geometry(f"+{x}+{y}")
 
     def show_update_dialog(self):
         if not self.update_info:
