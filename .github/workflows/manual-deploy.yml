@@ -1,0 +1,68 @@
+name: Manual Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "New app version, for example 1.0.1"
+        required: true
+        type: string
+      notes:
+        description: "Update notes shown in the app"
+        required: false
+        default: "A new Watch update is available."
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Update version files
+        shell: pwsh
+        run: |
+          $version = "${{ inputs.version }}".Trim()
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Version must use x.y.z format, for example 1.0.1"
+          }
+
+          $source = Get-Content screen_share_party.py -Raw
+          $source = $source -replace 'APP_VERSION = "[^"]+"', "APP_VERSION = `"$version`""
+          Set-Content screen_share_party.py $source -Encoding UTF8
+
+          $manifest = [ordered]@{
+            version = $version
+            download_url = "https://github.com/${{ github.repository }}/raw/main/dist/Watch.exe"
+            notes = "${{ inputs.notes }}"
+          }
+          $manifest | ConvertTo-Json | Set-Content update.json -Encoding UTF8
+
+      - name: Build Watch.exe
+        run: python -m PyInstaller --noconfirm --onefile --windowed --name Watch --distpath dist --workpath build screen_share_party.py
+
+      - name: Commit deploy artifacts
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add screen_share_party.py update.json dist/Watch.exe
+          git commit -m "Deploy Watch ${{ inputs.version }}"
+          git push

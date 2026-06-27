@@ -7,22 +7,31 @@ import queue
 import secrets
 import socket
 import struct
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
+import urllib.error
+import urllib.request
 import zlib
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 
+APP_VERSION = "1.0.0"
+UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/GianCarlozxc/Palabas/main/update.json"
+DEFAULT_DOWNLOAD_URL = "https://github.com/GianCarlozxc/Palabas/raw/main/dist/Watch.exe"
+UPDATE_CHECK_INTERVAL_MS = 5 * 60 * 1000
 FRAME_HEADER = struct.Struct("!III")
 DEFAULT_PORT = 5050
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watch_settings.json")
-STREAM_FPS = 10
-VIEWER_RENDER_FPS = 10
+STREAM_FPS = 8
+VIEWER_RENDER_FPS = 12
 CAPTURE_INTERVAL_MS = int(1000 / STREAM_FPS)
 VIEWER_RENDER_INTERVAL_MS = int(1000 / VIEWER_RENDER_FPS)
-PREVIEW_INTERVAL_MS = 250
+PREVIEW_INTERVAL_MS = 500
 MAX_PREVIEW_WIDTH = 1280
 MAX_PREVIEW_HEIGHT = 720
 WAITING_WIDTH = 1280
@@ -31,37 +40,37 @@ MAX_RENDER_WIDTH = 1600
 MAX_RENDER_HEIGHT = 900
 MAX_FULLSCREEN_RENDER_WIDTH = 1280
 MAX_FULLSCREEN_RENDER_HEIGHT = 720
-JPEG_QUALITY = 68
+JPEG_QUALITY = 58
 QUALITY_PROFILES = {
-    "Low": {"quality": 45, "width": 960, "height": 540},
-    "Balanced": {"quality": 68, "width": 1280, "height": 720},
-    "High": {"quality": 82, "width": 1600, "height": 900},
+    "Low": {"quality": 38, "width": 854, "height": 480},
+    "Balanced": {"quality": 58, "width": 1152, "height": 648},
+    "High": {"quality": 72, "width": 1280, "height": 720},
 }
 MAX_FRAME_WIDTH = 4096
 MAX_FRAME_HEIGHT = 2160
 MAX_PAYLOAD_SIZE = 8 * 1024 * 1024
-SOCKET_BUFFER_SIZE = 65536
-SEND_TIMEOUT_SECONDS = 0.08
+SOCKET_BUFFER_SIZE = 262144
+SEND_TIMEOUT_SECONDS = 0.03
 RECONNECT_DELAY_MS = 3000
 WAITING_FRAME = bytes([8, 8, 8]) * WAITING_WIDTH * WAITING_HEIGHT
-BG = "#090A0F"
-PANEL = "#11131C"
-PANEL_2 = "#171A25"
-SURFACE = "#222838"
-INPUT = "#0D1018"
+BG = "#050810"
+PANEL = "#0B1020"
+PANEL_2 = "#111827"
+SURFACE = "#1B2333"
+INPUT = "#0A0F1C"
 ACCENT = "#22C55E"
 ACCENT_HOVER = "#16A34A"
 TEXT = "#F8FAFC"
 MUTED = "#94A3B8"
-BORDER = "#2A3142"
+BORDER = "#263148"
 WARNING = "#F59E0B"
 
 # Dark Mode Colors
-DARK_BG = "#090A0F"
-DARK_PANEL = "#11131C"
-DARK_PANEL_2 = "#171A25"
-DARK_SURFACE = "#222838"
-DARK_INPUT = "#0D1018"
+DARK_BG = "#050810"
+DARK_PANEL = "#0B1020"
+DARK_PANEL_2 = "#111827"
+DARK_SURFACE = "#1B2333"
+DARK_INPUT = "#0A0F1C"
 DARK_TEXT = "#F9FAFB"
 DARK_MUTED = "#94A3B8"
 DARK_BORDER = "#2A3142"
@@ -288,7 +297,7 @@ def validate_frame_header(width, height, payload_size):
 def make_packet(width, height, rgb, jpeg_quality=JPEG_QUALITY):
     image = Image.frombytes("RGB", (width, height), rgb)
     payload_buffer = io.BytesIO()
-    image.save(payload_buffer, format="JPEG", quality=jpeg_quality, optimize=False, subsampling=2)
+    image.save(payload_buffer, format="JPEG", quality=jpeg_quality, optimize=False, progressive=False, subsampling=2)
     payload = payload_buffer.getvalue()
     return FRAME_HEADER.pack(width, height, len(payload)) + payload
 
@@ -435,7 +444,7 @@ class ShareServer:
                     try:
                         client.sendall(packet)
                         self.client_versions[client] = packet_version
-                    except OSError:
+                    except (socket.timeout, OSError):
                         dead_clients.append(client)
 
                 if dead_clients:
@@ -451,7 +460,7 @@ class ShareServer:
                                 pass
                     self._viewers_changed()
 
-                time.sleep(1 / STREAM_FPS)
+                time.sleep(max(0.01, 1 / STREAM_FPS))
         finally:
             self.stop_event.set()
             try:
@@ -591,13 +600,16 @@ class ScreenShareApp(tk.Tk):
         self.last_viewer_render_time = 0
         self.waiting_packet = make_packet(WAITING_WIDTH, WAITING_HEIGHT, WAITING_FRAME)
         self.photo = None
+        self.placeholder_photo = None
+        self.placeholder_size = None
+        self.display_message = None
         self.fullscreen_photo = None
         self.server = None
         self.client = None
         self.page = "name"
         self.viewer_frames = queue.Queue(maxsize=1)
         self.mode = tk.StringVar(value="share")
-        self.host = tk.StringVar(value="127.0.0.1")
+        self.host = tk.StringVar(value="")
         self.port = tk.IntVar(value=DEFAULT_PORT)
         self.user_name = tk.StringVar()
         self.room_code = tk.StringVar()
@@ -625,16 +637,24 @@ class ScreenShareApp(tk.Tk):
         self.stop_button = None
         self.reconnect_button = None
         self.pause_button = None
+        self.maximized = False
+        self.normal_geometry = None
         self.auto_reconnect_enabled = tk.BooleanVar(value=True)
         self.reconnect_job = None
         self.reconnect_attempts = 0
+        self.session_body = None
+        self.controls_border = None
+        self.update_info = None
+        self.update_button = None
 
         self._build_ui()
         self._load_settings()
         self.bind("<Escape>", lambda _event: self.exit_fullscreen())
         self.bind("<Map>", self._restore_borderless)
+        self.bind("<Configure>", self._sync_responsive_layout)
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self._schedule_preview()
+        self.after(1500, self.check_for_updates)
 
     def _build_ui(self):
         self.nav_labels = []
@@ -710,32 +730,50 @@ class ScreenShareApp(tk.Tk):
             arrowcolor=[("active", "white")],
         )
 
-        self.root = ttk.Frame(self, padding=18)
+        self.shell_border = tk.Frame(self, bg="#142033", padx=1, pady=1)
+        self.shell_border.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
+        self.root = tk.Frame(self.shell_border, bg=BG)
         self.root.pack(fill=tk.BOTH, expand=True)
 
-        self.header = tk.Frame(self.root, bg=BG)
-        self.header.pack(fill=tk.X, pady=(0, 16))
+        self.header = tk.Frame(self.root, bg="#070B15", height=86)
+        self.header.pack(fill=tk.X, padx=14, pady=(14, 0))
+        self.header.pack_propagate(False)
         self.header.columnconfigure(0, weight=0)
         self.header.columnconfigure(1, weight=0)
-        self.header.columnconfigure(2, weight=1)
+        self.header.columnconfigure(2, weight=0)
         self.header.columnconfigure(3, weight=0)
-        self.header.columnconfigure(4, weight=0)
+        self.header.columnconfigure(4, weight=1)
         self.header.columnconfigure(5, weight=0)
         self.header.columnconfigure(6, weight=0)
+        self.header.columnconfigure(7, weight=0)
+        self.header.columnconfigure(8, weight=0)
+        self.header.columnconfigure(9, weight=0)
         self.header.bind("<ButtonPress-1>", self._start_window_drag)
         self.header.bind("<B1-Motion>", self._drag_window)
 
-        self.brand_frame = tk.Frame(self.header, bg=BG)
-        self.brand_frame.grid(row=0, column=0, sticky="w")
+        self.brand_frame = tk.Frame(self.header, bg="#070B15")
+        self.brand_frame.grid(row=0, column=0, sticky="w", padx=(26, 18), pady=18)
         self.brand_frame.bind("<ButtonPress-1>", self._start_window_drag)
         self.brand_frame.bind("<B1-Motion>", self._drag_window)
+
+        self.logo_icon = tk.Canvas(
+            self.brand_frame,
+            width=42,
+            height=36,
+            bg="#070B15",
+            highlightthickness=0,
+            bd=0,
+        )
+        self.logo_icon.pack(side=tk.LEFT, padx=(0, 12))
+        self.logo_icon.create_rectangle(3, 3, 39, 33, outline=ACCENT, width=2)
+        self.logo_icon.create_polygon(17, 12, 17, 24, 27, 18, fill=TEXT, outline=TEXT)
         
         self.logo_label = tk.Label(
             self.brand_frame,
             text="WATCH",
-            bg=BG,
+            bg="#070B15",
             fg=TEXT,
-            font=("Segoe UI", 18, "bold"),
+            font=("Segoe UI", 20, "bold"),
             padx=0,
         )
         self.logo_label.pack(side=tk.LEFT)
@@ -744,33 +782,33 @@ class ScreenShareApp(tk.Tk):
 
         self.logo_mark = tk.Label(
             self.brand_frame,
-            text="LIVE",
-            bg=ACCENT,
-            fg="#04130A",
-            font=("Segoe UI", 8, "bold"),
-            padx=8,
-            pady=3,
+            text="● LIVE",
+            bg="#0D342A",
+            fg="#31F287",
+            font=("Segoe UI", 10, "bold"),
+            padx=10,
+            pady=7,
         )
-        self.logo_mark.pack(side=tk.LEFT, padx=(10, 0))
+        self.logo_mark.pack(side=tk.LEFT, padx=(14, 0))
         self.logo_mark.bind("<ButtonPress-1>", self._start_window_drag)
         self.logo_mark.bind("<B1-Motion>", self._drag_window)
         
         self.nav_frame = tk.Frame(self.header, bg=BG)
-        self.nav_frame.grid(row=0, column=1, sticky="w", padx=(22, 0))
+        self.nav_frame.grid(row=0, column=1, sticky="w", pady=18)
         for label in ("Profile", "Rooms", "Session"):
             lbl = tk.Label(
                 self.nav_frame,
                 text=label,
-                bg=BG,
-                fg=MUTED,
-                font=("Segoe UI", 10, "bold"),
+                bg="#070B15",
+                fg="#C7D2E6",
+                font=("Segoe UI", 12, "bold"),
                 cursor="hand2",
             )
-            lbl.pack(side=tk.LEFT, padx=(0, 18))
+            lbl.pack(side=tk.LEFT, padx=(0, 34))
             def make_hover(l):
                 return lambda e: l.config(fg=TEXT)
             def make_leave(l):
-                return lambda e: l.config(fg=MUTED)
+                return lambda e: l.config(fg="#C7D2E6")
             lbl.bind("<Enter>", make_hover(lbl))
             lbl.bind("<Leave>", make_leave(lbl))
             self.nav_labels.append(lbl)
@@ -778,38 +816,77 @@ class ScreenShareApp(tk.Tk):
         self.theme_mode = tk.StringVar(value="dark")
         self.theme_toggle_btn = tk.Canvas(
             self.header,
-            width=34,
-            height=30,
+            width=58,
+            height=48,
             bg=SURFACE,
             cursor="hand2",
             highlightthickness=0,
             bd=0,
         )
-        self.theme_toggle_btn.grid(row=0, column=4, sticky="e", padx=(12, 0))
+        self.theme_toggle_btn.grid(row=0, column=6, sticky="e", padx=(16, 0), pady=18)
         self.theme_toggle_btn.bind("<Button-1>", lambda _event: self.toggle_theme())
         self.theme_toggle_btn.bind("<Enter>", lambda _event: self._draw_theme_icon(hover=True))
         self.theme_toggle_btn.bind("<Leave>", lambda _event: self._draw_theme_icon(hover=False))
         self._draw_theme_icon()
 
+        self.update_button = tk.Button(
+            self.header,
+            text="Update available",
+            command=self.show_update_dialog,
+            bg="#0D342A",
+            activebackground="#14532D",
+            fg="#31F287",
+            activeforeground="#F8FAFC",
+            relief=tk.FLAT,
+            bd=0,
+            cursor="hand2",
+            font=("Segoe UI", 10, "bold"),
+            padx=14,
+            pady=10,
+        )
+        self.update_button.grid(row=0, column=4, sticky="e", padx=(12, 0), pady=18)
+        self.update_button.grid_remove()
+
         self.minimize_button = self._window_control_button("-", self._minimize_window)
-        self.minimize_button.grid(row=0, column=5, sticky="e", padx=(8, 0))
+        self.minimize_button.grid(row=0, column=7, sticky="e", padx=(12, 0), pady=18)
+
+        self.maximize_button = self._window_control_button("□", self._toggle_maximize)
+        self.maximize_button.grid(row=0, column=8, sticky="e", padx=(12, 0), pady=18)
 
         self.close_button = self._window_control_button("X", self.destroy, danger=True)
-        self.close_button.grid(row=0, column=6, sticky="e", padx=(6, 0))
+        self.close_button.grid(row=0, column=9, sticky="e", padx=(12, 28), pady=18)
         
         self.status_label = tk.Label(
             self.header,
             textvariable=self.status,
-            bg=PANEL_2,
+            bg="#0E1525",
             fg=TEXT,
-            font=("Segoe UI", 9, "bold"),
-            padx=12,
-            pady=6,
+            font=("Segoe UI", 11, "bold"),
+            padx=18,
+            pady=10,
         )
-        self.status_label.grid(row=0, column=3, sticky="e")
+        self.status_label.grid(row=0, column=5, sticky="e", pady=18)
 
-        self.content = ttk.Frame(self.root)
-        self.content.pack(fill=tk.BOTH, expand=True)
+        self.bottom_bar = tk.Frame(self.root, bg="#070B15", height=70)
+        self.bottom_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=30, pady=(0, 18))
+        self.bottom_bar.pack_propagate(False)
+        tk.Label(
+            self.bottom_bar,
+            text="●  Connected to LAN",
+            bg="#070B15",
+            fg="#31F287",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(side=tk.LEFT, padx=(28, 36))
+        tk.Label(
+            self.bottom_bar,
+            text="0 peers online",
+            bg="#070B15",
+            fg="#C7D2E6",
+            font=("Segoe UI", 11),
+        ).pack(side=tk.LEFT)
+
+        self.content = tk.Frame(self.root, bg=BG)
+        self.content.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=30, pady=0)
 
         self._build_name_page()
         self._build_room_page()
@@ -851,6 +928,8 @@ class ScreenShareApp(tk.Tk):
     def _drag_window(self, event):
         if not self._drag_start:
             return
+        if self.maximized:
+            self._toggle_maximize()
         x_offset, y_offset = self._drag_start
         self.geometry(f"+{event.x_root - x_offset}+{event.y_root - y_offset}")
 
@@ -858,9 +937,36 @@ class ScreenShareApp(tk.Tk):
         self.overrideredirect(False)
         self.iconify()
 
+    def _toggle_maximize(self):
+        if self.maximized:
+            if self.normal_geometry:
+                self.geometry(self.normal_geometry)
+            self.maximized = False
+            if hasattr(self, "maximize_button"):
+                self.maximize_button.configure(text="□")
+            return
+
+        self.normal_geometry = self.geometry()
+        work_width = self.winfo_screenwidth()
+        work_height = self.winfo_screenheight()
+        self.geometry(f"{work_width}x{work_height}+0+0")
+        self.maximized = True
+        if hasattr(self, "maximize_button"):
+            self.maximize_button.configure(text="❐")
+
     def _restore_borderless(self, _event=None):
         if self.state() == "normal":
             self.after(10, lambda: self.overrideredirect(True))
+
+    def _sync_responsive_layout(self, _event=None):
+        width = max(1, self.winfo_width())
+        if hasattr(self, "controls_border") and self.controls_border and self.controls_border.winfo_exists():
+            sidebar_width = max(318, min(390, int(width * 0.18)))
+            self.controls_border.configure(width=sidebar_width)
+            if self.session_body and self.session_body.winfo_exists():
+                self.session_body.columnconfigure(1, minsize=sidebar_width)
+        if self.display_message and self.display:
+            self.after_idle(lambda: self._set_display_message(self.display_message))
 
     def toggle_theme(self):
         if self.theme_mode.get() == "dark":
@@ -877,21 +983,21 @@ class ScreenShareApp(tk.Tk):
         self.theme_toggle_btn.configure(bg=bg)
         self.theme_toggle_btn.delete("all")
         if self.theme_mode.get() == "dark":
-            self.theme_toggle_btn.create_oval(13, 11, 21, 19, fill=fg, outline=fg)
+            self.theme_toggle_btn.create_oval(24, 19, 34, 29, fill=fg, outline=fg)
             for x1, y1, x2, y2 in (
-                (17, 4, 17, 8),
-                (17, 22, 17, 26),
-                (5, 15, 9, 15),
-                (25, 15, 29, 15),
-                (8, 6, 11, 9),
-                (23, 21, 26, 24),
-                (8, 24, 11, 21),
-                (23, 9, 26, 6),
+                (29, 8, 29, 14),
+                (29, 34, 29, 40),
+                (13, 24, 19, 24),
+                (39, 24, 45, 24),
+                (17, 12, 21, 16),
+                (37, 32, 41, 36),
+                (17, 36, 21, 32),
+                (37, 16, 41, 12),
             ):
                 self.theme_toggle_btn.create_line(x1, y1, x2, y2, fill=fg, width=2, capstyle=tk.ROUND)
         else:
-            self.theme_toggle_btn.create_oval(10, 7, 24, 23, fill=fg, outline=fg)
-            self.theme_toggle_btn.create_oval(16, 4, 29, 20, fill=bg, outline=bg)
+            self.theme_toggle_btn.create_oval(20, 14, 38, 32, fill=fg, outline=fg)
+            self.theme_toggle_btn.create_oval(28, 10, 45, 28, fill=bg, outline=bg)
 
     def _apply_theme(self):
         is_dark = (self.theme_mode.get() == "dark")
@@ -998,13 +1104,15 @@ class ScreenShareApp(tk.Tk):
             self.minimize_button.configure(bg=SURFACE, activebackground=BORDER, fg=TEXT, activeforeground=TEXT)
         if hasattr(self, "close_button") and self.close_button.winfo_exists():
             self.close_button.configure(bg="#7F1D1D", activebackground="#991B1B", fg=TEXT, activeforeground=TEXT)
+        if hasattr(self, "update_button") and self.update_button and self.update_button.winfo_exists():
+            self.update_button.configure(bg="#0D342A", activebackground="#14532D", fg="#31F287", activeforeground="#F8FAFC")
         if hasattr(self, "source_combo") and self.source_combo.winfo_exists():
             self.source_combo.configure(style="Source.TCombobox")
             
         if hasattr(self, "custom_buttons"):
             for btn in self.custom_buttons:
                 if btn.winfo_exists():
-                    is_primary = (btn.cget("text") in ("CONTINUE", "CREATE ROOM", "JOIN ROOM", "START"))
+                    is_primary = (btn.cget("text") in ("CONTINUE", "CREATE ROOM", "JOIN ROOM", "START", "UPDATE NOW"))
                     btn.configure(
                         bg=ACCENT if is_primary else SURFACE,
                         activebackground=ACCENT_HOVER if is_primary else BORDER,
@@ -1084,194 +1192,480 @@ class ScreenShareApp(tk.Tk):
         return btn
 
     def _build_name_page(self):
-        page = ttk.Frame(self.content)
+        page = tk.Frame(self.content, bg=BG)
         self.frames["name"] = page
 
-        shell = ttk.Frame(page)
-        shell.place(relx=0.5, rely=0.5, anchor=tk.CENTER, width=760)
+        shell = tk.Frame(page, bg=BG)
+        shell.pack(fill=tk.BOTH, expand=True, padx=18, pady=(34, 22))
         shell.columnconfigure(0, weight=1)
-        shell.columnconfigure(1, weight=0, minsize=320)
+        shell.columnconfigure(1, weight=0, minsize=520)
+        shell.rowconfigure(0, weight=1)
 
-        intro = ttk.Frame(shell)
-        intro.grid(row=0, column=0, sticky="nsew", padx=(0, 28))
+        intro = tk.Frame(shell, bg=BG)
+        intro.grid(row=0, column=0, sticky="nsew", padx=(30, 34))
+        intro.columnconfigure(0, weight=1)
 
-        ttk.Label(
+        tk.Label(
             intro,
             text="WATCH PARTY",
+            bg=BG,
             foreground=ACCENT,
-            font=("Segoe UI", 9, "bold"),
-        ).pack(anchor="w")
-        ttk.Label(
+            font=("Segoe UI", 11, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        accent_line = tk.Canvas(intro, width=170, height=12, bg=BG, highlightthickness=0, bd=0)
+        accent_line.grid(row=1, column=0, sticky="w", pady=(6, 34))
+        accent_line.create_line(0, 5, 170, 5, fill="#0B2C24", width=2)
+        accent_line.create_line(0, 5, 82, 5, fill=ACCENT, width=2)
+
+        tk.Label(
             intro,
-            text="Share a screen. Keep everyone in sync.",
-            font=("Segoe UI", 30, "bold"),
-            wraplength=360,
-        ).pack(anchor="w", pady=(8, 12))
-        ttk.Label(
+            text="Share a screen.\nKeep everyone\nin sync.",
+            bg=BG,
+            fg=TEXT,
+            font=("Segoe UI", 27, "bold"),
+            justify=tk.LEFT,
+            wraplength=520,
+        ).grid(row=2, column=0, sticky="w")
+        tk.Label(
             intro,
             text="A lightweight LAN viewer for rooms, watch parties, and quick screen handoff.",
-            foreground=MUTED,
-            wraplength=360,
+            bg=BG,
+            fg="#B9C5D8",
+            wraplength=400,
+            justify=tk.LEFT,
+            font=("Segoe UI", 12),
+        ).grid(row=3, column=0, sticky="nw", pady=(14, 0))
+
+        art = tk.Canvas(intro, width=520, height=76, bg=BG, highlightthickness=0, bd=0)
+        art.grid(row=4, column=0, sticky="sw", pady=(4, 0))
+        art.create_oval(130, 30, 470, 142, outline="#12372E", width=2)
+        art.create_oval(188, 48, 416, 120, outline="#154A39", width=1)
+        art.create_rectangle(250, 4, 492, 74, outline="#295264", width=2)
+        art.create_rectangle(258, 12, 484, 66, outline="#0E1A2B", fill="#08111E")
+        art.create_polygon(360, 28, 360, 54, 384, 41, fill=ACCENT, outline=ACCENT)
+        art.create_oval(330, 58, 362, 90, fill="#07111E", outline=ACCENT, width=2)
+        art.create_oval(244, 62, 274, 92, fill="#07111E", outline=ACCENT, width=2)
+        art.create_oval(416, 62, 446, 92, fill="#07111E", outline=ACCENT, width=2)
+        art.create_oval(385, 56, 399, 70, fill=ACCENT, outline=ACCENT)
+        for x, y in ((126, 48), (180, 96), (505, 28), (310, 8), (445, 76)):
+            art.create_oval(x, y, x + 4, y + 4, fill=ACCENT, outline=ACCENT)
+
+        feature_box = tk.Frame(intro, bg=BG)
+        feature_box.grid(row=5, column=0, sticky="w", pady=(8, 0))
+        self._feature_row(feature_box, "LAN Powered", "Works seamlessly on your local network.", "wifi")
+        self._feature_row(feature_box, "Everyone in Sync", "Low latency, smooth viewing experience.", "people")
+        self._feature_row(feature_box, "Private & Secure", "Your room. Your rules. Your privacy.", "shield")
+
+        card_border = tk.Frame(shell, bg="#2B3952", padx=1, pady=1)
+        card_border.grid(row=0, column=1, sticky="nsew", padx=(0, 34), pady=(18, 22))
+        card = tk.Frame(card_border, bg="#101624", padx=44, pady=20)
+        card.pack(fill=tk.BOTH, expand=True)
+
+        icon = tk.Canvas(card, width=72, height=72, bg="#101624", highlightthickness=0, bd=0)
+        icon.pack(pady=(0, 12))
+        icon.create_oval(4, 4, 68, 68, outline="#133D32", width=2)
+        icon.create_oval(18, 18, 54, 54, outline=ACCENT, width=2)
+        icon.create_oval(30, 25, 38, 33, fill=TEXT, outline=TEXT)
+        icon.create_oval(43, 26, 50, 33, fill=TEXT, outline=TEXT)
+        icon.create_arc(23, 35, 45, 59, start=0, extent=180, outline=TEXT, width=3)
+        icon.create_arc(39, 36, 59, 57, start=0, extent=180, outline=TEXT, width=3)
+
+        tk.Label(
+            card,
+            text="Display name",
+            bg="#101624",
+            fg=TEXT,
+            font=("Segoe UI", 22, "bold"),
+        ).pack(anchor="center", pady=(0, 10))
+        tk.Label(
+            card,
+            text="This is shown to the room host.",
+            bg="#101624",
+            fg="#AEBBD0",
+            font=("Segoe UI", 13),
+        ).pack(anchor="center", pady=(0, 18))
+
+        entry_shell = tk.Frame(card, bg="#33445C", padx=1, pady=1)
+        entry_shell.pack(fill=tk.X, pady=(0, 28))
+        name_entry = tk.Entry(
+            entry_shell,
+            textvariable=self.user_name,
+            bg="#0B1020",
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief=tk.FLAT,
+            bd=0,
+            font=("Segoe UI", 15),
+        )
+        name_entry.pack(fill=tk.X, ipady=10, padx=1, pady=1)
+        self._button(card, "CONTINUE  >", self.continue_to_rooms, primary=True).pack(fill=tk.X, ipady=4)
+
+        tips_header = tk.Frame(card, bg="#101624")
+        tips_header.pack(fill=tk.X, pady=(22, 0))
+        tk.Frame(tips_header, bg="#2B3548", height=1).pack(side=tk.LEFT, fill=tk.X, expand=True, pady=8)
+        tk.Label(
+            tips_header,
+            text="TIPS",
+            bg="#101624",
+            fg="#4ADE80",
+            font=("Segoe UI", 10, "bold"),
+            padx=18,
+        ).pack(side=tk.LEFT)
+        tk.Frame(tips_header, bg="#2B3548", height=1).pack(side=tk.LEFT, fill=tk.X, expand=True, pady=8)
+        tip = tk.Frame(card, bg="#111A2B", highlightbackground="#263148", highlightthickness=1, padx=18, pady=10)
+        tip.pack(fill=tk.X, pady=(12, 0))
+        tk.Label(
+            tip,
+            text="Use a name others will recognize\nfor a better experience.",
+            bg="#111A2B",
+            fg="#D7DEEA",
+            justify=tk.LEFT,
             font=("Segoe UI", 10),
         ).pack(anchor="w")
 
-        card = ttk.Frame(shell, style="Panel.TFrame", padding=28)
-        card.grid(row=0, column=1, sticky="nsew")
-        ttk.Label(
-            card,
-            text="Display name",
-            style="Panel.TLabel",
-            foreground=TEXT,
-            font=("Segoe UI", 18, "bold"),
-        ).pack(anchor="w", pady=(0, 20))
-        ttk.Label(
-            card,
-            text="This is shown to the room host.",
-            style="Panel.TLabel",
-            foreground=MUTED,
-        ).pack(anchor="w", pady=(0, 8))
-        ttk.Entry(card, textvariable=self.user_name, width=34).pack(fill=tk.X, pady=(0, 16))
-        self._button(card, "CONTINUE", self.continue_to_rooms, primary=True).pack(fill=tk.X)
+    def _feature_row(self, parent, title, body, kind):
+        row = tk.Frame(parent, bg=BG)
+        row.pack(fill=tk.X, pady=(0, 12))
+        icon = tk.Canvas(row, width=48, height=48, bg=BG, highlightthickness=0, bd=0)
+        icon.pack(side=tk.LEFT, padx=(0, 16))
+        icon.create_rectangle(4, 4, 44, 44, fill="#0E2A24", outline="#112F2A")
+        if kind == "wifi":
+            icon.create_arc(13, 16, 35, 38, start=30, extent=120, outline=ACCENT, width=3)
+            icon.create_arc(18, 22, 30, 34, start=30, extent=120, outline=ACCENT, width=3)
+            icon.create_oval(23, 34, 28, 39, fill=ACCENT, outline=ACCENT)
+        elif kind == "people":
+            icon.create_oval(14, 14, 24, 24, fill=ACCENT, outline=ACCENT)
+            icon.create_oval(28, 15, 38, 25, fill=ACCENT, outline=ACCENT)
+            icon.create_arc(9, 24, 29, 44, start=0, extent=180, outline=ACCENT, width=3)
+            icon.create_arc(23, 26, 43, 44, start=0, extent=180, outline=ACCENT, width=3)
+        else:
+            icon.create_polygon(24, 10, 37, 16, 34, 34, 24, 41, 14, 34, 11, 16, fill="", outline=ACCENT, width=3)
+            icon.create_line(19, 25, 23, 30, 31, 20, fill=ACCENT, width=3)
+        text = tk.Frame(row, bg=BG)
+        text.pack(side=tk.LEFT)
+        tk.Label(text, text=title, bg=BG, fg=TEXT, font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        tk.Label(text, text=body, bg=BG, fg="#AEBBD0", font=("Segoe UI", 9)).pack(anchor="w", pady=(3, 0))
 
     def _build_room_page(self):
-        page = ttk.Frame(self.content)
+        page = tk.Frame(self.content, bg=BG)
         self.frames["room"] = page
 
-        shell = ttk.Frame(page)
-        shell.pack(fill=tk.BOTH, expand=True)
+        shell = tk.Frame(page, bg=BG)
+        shell.pack(fill=tk.BOTH, expand=True, padx=14, pady=(12, 14))
         shell.columnconfigure(0, weight=1)
         shell.columnconfigure(1, weight=1)
-        shell.rowconfigure(1, weight=1)
+        shell.rowconfigure(2, weight=1)
 
-        ttk.Label(
+        title = tk.Frame(shell, bg=BG)
+        title.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        title_text = tk.Frame(title, bg=BG)
+        title_text.pack(anchor="w")
+        tk.Label(
+            title_text,
+            text="Choose a ",
+            bg=BG,
+            fg=TEXT,
+            font=("Segoe UI", 24, "bold"),
+        ).pack(side=tk.LEFT)
+        tk.Label(
+            title_text,
+            text="mode",
+            bg=BG,
+            fg=ACCENT,
+            font=("Segoe UI", 24, "bold"),
+        ).pack(side=tk.LEFT)
+        tk.Label(
             shell,
-            text="Choose a mode",
-            font=("Segoe UI", 28, "bold"),
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(8, 18))
+            text="Host a room or join an existing one to start your watch party.",
+            bg=BG,
+            fg="#B9C5D8",
+            font=("Segoe UI", 11),
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 16))
 
-        create = ttk.Frame(shell, style="Panel.TFrame", padding=24)
-        create.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
-        ttk.Label(create, text="HOST", style="Panel.TLabel", foreground=ACCENT, font=("Segoe UI", 9, "bold")).pack(anchor="w")
-        ttk.Label(create, text="Create a room", style="Panel.TLabel", font=("Segoe UI", 22, "bold")).pack(anchor="w", pady=(8, 10))
-        ttk.Label(create, text="Start a LAN room, choose a source, and control when screen sharing begins.", style="Panel.TLabel", foreground=MUTED, wraplength=330).pack(anchor="w", pady=(0, 18))
-        ttk.Frame(create, style="Card.TFrame", height=1).pack(fill=tk.X, pady=(0, 18))
-        self._button(create, "CREATE ROOM", self.create_room, primary=True).pack(fill=tk.X)
+        create_border = tk.Frame(shell, bg="#263148", padx=1, pady=1)
+        create_border.grid(row=2, column=0, sticky="nsew", padx=(0, 12))
+        create = tk.Frame(create_border, bg="#0B1220", padx=28, pady=18)
+        create.pack(fill=tk.BOTH, expand=True)
 
-        join = ttk.Frame(shell, style="Panel.TFrame", padding=24)
-        join.grid(row=1, column=1, sticky="nsew", padx=(10, 0))
-        ttk.Label(join, text="VIEWER", style="Panel.TLabel", foreground=ACCENT, font=("Segoe UI", 9, "bold")).pack(anchor="w")
-        ttk.Label(join, text="Join a room", style="Panel.TLabel", font=("Segoe UI", 22, "bold")).pack(anchor="w", pady=(8, 10))
-        ttk.Label(join, text="Host address", style="Panel.TLabel", foreground=MUTED, font=("Segoe UI", 9, "bold")).pack(anchor="w")
-        ttk.Entry(join, textvariable=self.host, width=32).pack(fill=tk.X, pady=(6, 12))
-        ttk.Label(join, text="Port", style="Panel.TLabel", foreground=MUTED, font=("Segoe UI", 9, "bold")).pack(anchor="w")
-        ttk.Entry(join, textvariable=self.port, width=32).pack(fill=tk.X, pady=(6, 12))
-        ttk.Label(join, text="Room code", style="Panel.TLabel", foreground=MUTED, font=("Segoe UI", 9, "bold")).pack(anchor="w")
-        ttk.Entry(join, textvariable=self.join_code, width=32).pack(fill=tk.X, pady=(6, 18))
-        self._button(join, "JOIN ROOM", self.join_room, primary=True).pack(fill=tk.X)
+        join_border = tk.Frame(shell, bg="#263148", padx=1, pady=1)
+        join_border.grid(row=2, column=1, sticky="nsew", padx=(12, 0))
+        join = tk.Frame(join_border, bg="#0B1220", padx=28, pady=18)
+        join.pack(fill=tk.BOTH, expand=True)
+
+        self._pill_label(create, "HOST").pack(anchor="w", pady=(0, 12))
+        self._accent_heading(create, "Create ", "a room").pack(anchor="w")
+        tk.Label(
+            create,
+            text="Start a LAN room, choose a source,\nand control when screen sharing begins.",
+            bg="#0B1220",
+            fg="#C7D2E6",
+            justify=tk.LEFT,
+            font=("Segoe UI", 11),
+        ).pack(anchor="w", pady=(10, 0))
+
+        art = tk.Canvas(create, width=430, height=184, bg="#0B1220", highlightthickness=0, bd=0)
+        art.pack(fill=tk.X, expand=True, pady=(6, 8))
+        art.create_oval(74, 18, 386, 234, outline="#0B3029", width=1)
+        art.create_oval(112, 42, 348, 208, outline="#0D3B31", width=1)
+        art.create_oval(154, 66, 306, 180, outline="#12483A", width=1)
+        art.create_rectangle(164, 58, 332, 174, outline=ACCENT, width=3)
+        art.create_rectangle(171, 66, 325, 166, fill="#07111E", outline="#102133")
+        art.create_oval(222, 92, 274, 144, outline=ACCENT, width=2)
+        art.create_line(248, 103, 248, 133, fill=ACCENT, width=4)
+        art.create_line(234, 118, 262, 118, fill=ACCENT, width=4)
+        art.create_rectangle(236, 174, 256, 196, fill="#0D2A26", outline="#17443A")
+        art.create_polygon(184, 196, 306, 196, 274, 204, 154, 204, fill="#0D2A26", outline="#17443A")
+        art.create_oval(48, 166, 90, 208, fill="#07111E", outline=ACCENT, width=1)
+        art.create_oval(84, 158, 128, 202, fill="#07111E", outline=ACCENT, width=1)
+        art.create_oval(124, 166, 166, 208, fill="#07111E", outline=ACCENT, width=1)
+        for x, y in ((78, 116), (104, 28), (340, 28), (388, 120), (356, 78)):
+            art.create_oval(x, y, x + 7, y + 7, fill="#0E3B31", outline="#0E3B31")
+
+        self._button(create, "CREATE ROOM      ->", self.create_room, primary=True).pack(fill=tk.X, ipady=8, pady=(0, 0))
+
+        self._pill_label(join, "VIEWER").pack(anchor="w", pady=(0, 12))
+        self._accent_heading(join, "Join ", "a room").pack(anchor="w", pady=(0, 14))
+        self._room_entry(join, "Host address", self.host, "▣").pack(fill=tk.X, pady=(0, 9))
+        self._room_entry(join, "Port", self.port, "▤").pack(fill=tk.X, pady=(0, 9))
+        self._room_entry(join, "Room code (optional)", self.join_code, "▢").pack(fill=tk.X, pady=(0, 12))
+        self._button(join, "JOIN ROOM      ->", self.join_room, primary=True).pack(fill=tk.X, ipady=8)
+
+    def _pill_label(self, parent, text):
+        return tk.Label(
+            parent,
+            text=text,
+            bg="#0D342A",
+            fg="#31F287",
+            font=("Segoe UI", 9, "bold"),
+            padx=12,
+            pady=5,
+        )
+
+    def _accent_heading(self, parent, leading, accent):
+        row = tk.Frame(parent, bg=parent.cget("bg"))
+        tk.Label(row, text=leading, bg=parent.cget("bg"), fg=TEXT, font=("Segoe UI", 20, "bold")).pack(side=tk.LEFT)
+        tk.Label(row, text=accent, bg=parent.cget("bg"), fg=ACCENT, font=("Segoe UI", 20, "bold")).pack(side=tk.LEFT)
+        return row
+
+    def _room_entry(self, parent, label, variable, icon):
+        wrapper = tk.Frame(parent, bg=parent.cget("bg"))
+        tk.Label(
+            wrapper,
+            text=label,
+            bg=parent.cget("bg"),
+            fg="#C7D2E6",
+            font=("Segoe UI", 10),
+        ).pack(anchor="w", pady=(0, 7))
+        border = tk.Frame(wrapper, bg="#33445C", padx=1, pady=1)
+        border.pack(fill=tk.X)
+        box = tk.Frame(border, bg="#07111E", padx=14, pady=0)
+        box.pack(fill=tk.X)
+        tk.Label(box, text=icon, bg="#07111E", fg=ACCENT, font=("Segoe UI", 14, "bold")).pack(side=tk.LEFT, padx=(0, 12))
+        tk.Entry(
+            box,
+            textvariable=variable,
+            bg="#07111E",
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief=tk.FLAT,
+            bd=0,
+            font=("Segoe UI", 12),
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=8)
+        return wrapper
+
+    def _display_resized(self, _event=None):
+        if self.current_rgb_frame:
+            self._rerender_current_frame()
+        elif self.display_message:
+            self._set_display_message(self.display_message)
+
+    def _font(self, size, bold=False):
+        names = ("segoeuib.ttf", "seguisb.ttf") if bold else ("segoeui.ttf",)
+        for name in names:
+            try:
+                return ImageFont.truetype(name, size)
+            except OSError:
+                continue
+        return ImageFont.load_default()
+
+    def _set_display_message(self, message):
+        if not self.display:
+            return
+        width = max(420, self.display.winfo_width())
+        height = max(320, self.display.winfo_height())
+        if self.display_message == message and self.placeholder_size == (width, height) and self.placeholder_photo:
+            self.display.configure(text="", image=self.placeholder_photo)
+            return
+        self.display_message = message
+        self.placeholder_size = (width, height)
+        image = Image.new("RGB", (width, height), "#050A12")
+        draw = ImageDraw.Draw(image)
+
+        cx = width // 2
+        scale = max(0.85, min(1.65, min(width / 900, height / 620)))
+        art_y = int(height / 2 - 185 * scale)
+        art_y = max(int(50 * scale), art_y)
+
+        def sx(value):
+            return int(value * scale)
+
+        def pt(x, y):
+            return (cx + sx(x), art_y + sx(y))
+
+        for i, color in enumerate(("#09261F", "#0B352B", "#0E4536")):
+            pad = sx(i * 34)
+            draw.ellipse(
+                (cx - sx(170) + pad, art_y - sx(40) + pad, cx + sx(170) - pad, art_y + sx(220) - pad),
+                outline=color,
+                width=max(1, sx(1)),
+            )
+        for dx, dy in ((-150, 40), (-64, -34), (118, -12), (174, 72), (72, -56)):
+            px, py = pt(dx, dy)
+            r = sx(3)
+            draw.ellipse((px - r, py - r, px + r, py + r), fill=ACCENT)
+
+        screen = (cx - sx(74), art_y + sx(24), cx + sx(74), art_y + sx(110))
+        draw.rounded_rectangle(screen, radius=sx(8), outline=ACCENT, width=max(2, sx(3)), fill="#07111E")
+        draw.polygon([pt(-13, 50), pt(-13, 84), pt(19, 67)], outline=ACCENT, fill=None)
+        for px in (-54, 0, 54):
+            pcx = cx + sx(px)
+            draw.ellipse((pcx - sx(18), art_y + sx(118), pcx + sx(18), art_y + sx(154)), outline=ACCENT, width=max(1, sx(1)))
+            draw.arc((pcx - sx(38), art_y + sx(142), pcx + sx(38), art_y + sx(198)), 180, 360, fill=ACCENT, width=max(1, sx(1)))
+
+        title_font = self._font(max(24, sx(30)), bold=True)
+        sub_font = self._font(max(11, sx(13)))
+        button_font = self._font(max(10, sx(12)), bold=True)
+        if message == "Room is open. Screen sharing is off.":
+            lines = [("Room is open.", TEXT), ("Screen sharing is off.", TEXT)]
+            subtitle = "Share your screen to begin."
+        else:
+            lines = [(message, TEXT)]
+            subtitle = ""
+        text_y = art_y + sx(205)
+        for line, fill in lines:
+            bbox = draw.textbbox((0, 0), line, font=title_font)
+            draw.text((cx - (bbox[2] - bbox[0]) // 2, text_y), line, fill=fill, font=title_font)
+            text_y += sx(38)
+        if subtitle:
+            bbox = draw.textbbox((0, 0), subtitle, font=sub_font)
+            draw.text((cx - (bbox[2] - bbox[0]) // 2, text_y + sx(4)), subtitle, fill="#AEBBD0", font=sub_font)
+            text_y += sx(36)
+        btn_text = "START SHARING" if message == "Room is open. Screen sharing is off." else "START"
+        btn_w, btn_h = sx(168), sx(46)
+        draw.rounded_rectangle((cx - btn_w // 2, text_y, cx + btn_w // 2, text_y + btn_h), radius=sx(8), outline=ACCENT, width=max(1, sx(1)))
+        bbox = draw.textbbox((0, 0), btn_text, font=button_font)
+        draw.text((cx - (bbox[2] - bbox[0]) // 2, text_y + sx(14)), btn_text, fill=ACCENT, font=button_font)
+
+        self.placeholder_photo = ImageTk.PhotoImage(image)
+        self.display.configure(text="", image=self.placeholder_photo)
 
     def _build_session_page(self):
-        body = ttk.Frame(self.content)
+        body = tk.Frame(self.content, bg=BG)
         self.frames["session"] = body
+        self.session_body = body
         body.pack(fill=tk.BOTH, expand=True)
         body.columnconfigure(0, weight=1)
-        body.columnconfigure(1, weight=0, minsize=320)
+        body.columnconfigure(1, weight=0, minsize=318)
         body.rowconfigure(0, weight=1)
 
-        stage = ttk.Frame(body, style="Panel.TFrame", padding=10)
-        stage.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+        stage_border = tk.Frame(body, bg="#263148", padx=1, pady=1)
+        stage_border.grid(row=0, column=0, sticky="nsew", padx=(0, 12), pady=(8, 14))
+        stage = tk.Frame(stage_border, bg="#050A12")
+        stage.pack(fill=tk.BOTH, expand=True)
         stage.rowconfigure(0, weight=1)
         stage.columnconfigure(0, weight=1)
 
-        display_wrap = tk.Frame(stage, bg="#000000", padx=1, pady=1)
-        display_wrap.grid(row=0, column=0, sticky="nsew")
-
         self.display = tk.Label(
-            display_wrap,
+            stage,
             text="No active stream",
-            bg="#000000",
+            bg="#050A12",
             fg="#F9FAFB",
             anchor=tk.CENTER,
             compound=tk.CENTER,
-            font=("Segoe UI", 26, "bold"),
+            font=("Segoe UI", 24, "bold"),
         )
-        self.display.pack(fill=tk.BOTH, expand=True)
+        self.display.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
         self.display.bind("<Double-Button-1>", lambda _event: self.enter_fullscreen())
-        self.display.bind("<Configure>", lambda _event: self._rerender_current_frame())
+        self.display.bind("<Configure>", self._display_resized)
 
-        controls_shell = ttk.Frame(body, style="Panel.TFrame")
-        controls_shell.grid(row=0, column=1, sticky="ns")
-        controls_shell.configure(width=320)
-        controls_shell.grid_propagate(False)
-
-        controls_canvas = tk.Canvas(
-            controls_shell,
-            bg=PANEL,
-            highlightthickness=0,
-            borderwidth=0,
-            width=320,
+        self.stage_secure_badge = tk.Label(
+            stage,
+            text="Secure LAN Connection\nYour connection is private and local.",
+            bg="#101827",
+            fg="#AEBBD0",
+            justify=tk.LEFT,
+            font=("Segoe UI", 8),
+            padx=14,
+            pady=9,
         )
-        controls_scrollbar = ttk.Scrollbar(controls_shell, orient=tk.VERTICAL, command=controls_canvas.yview)
-        controls_canvas.configure(yscrollcommand=controls_scrollbar.set)
-        controls_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        controls_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.stage_secure_badge.place(relx=0.03, rely=0.92, anchor="sw")
+        self.stage_viewer_badge = tk.Label(
+            stage,
+            text="0\nViewers in room",
+            bg="#101827",
+            fg="#AEBBD0",
+            justify=tk.LEFT,
+            font=("Segoe UI", 8),
+            padx=14,
+            pady=9,
+        )
+        self.stage_viewer_badge.place(relx=0.97, rely=0.92, anchor="se")
 
-        controls = ttk.Frame(controls_canvas, style="Panel.TFrame", padding=16)
-        controls_window = controls_canvas.create_window((0, 0), window=controls, anchor="nw", width=300)
+        controls_border = tk.Frame(body, bg="#263148", padx=1, pady=1)
+        self.controls_border = controls_border
+        controls_border.grid(row=0, column=1, sticky="nsew", pady=(8, 14))
+        controls_border.configure(width=318)
+        controls_border.grid_propagate(False)
+        controls = tk.Frame(controls_border, bg="#0B1220", padx=13, pady=9)
+        controls.pack(fill=tk.BOTH, expand=True)
 
-        def sync_scroll_region(_event=None):
-            controls_canvas.configure(scrollregion=controls_canvas.bbox("all"))
-
-        def sync_controls_width(event):
-            controls_canvas.itemconfigure(controls_window, width=max(280, event.width - 18))
-
-        controls.bind("<Configure>", sync_scroll_region)
-        controls_canvas.bind("<Configure>", sync_controls_width)
-
-        ttk.Label(
+        tk.Label(
             controls,
             text="SESSION",
-            style="Panel.TLabel",
-            foreground=ACCENT,
+            bg="#0B1220",
+            fg=ACCENT,
             font=("Segoe UI", 9, "bold"),
         ).pack(anchor="w")
-        self.session_title = ttk.Label(
+        self.session_title = tk.Label(
             controls,
             text="Room",
-            style="Panel.TLabel",
-            font=("Segoe UI", 19, "bold"),
+            bg="#0B1220",
+            fg=TEXT,
+            font=("Segoe UI", 15, "bold"),
         )
-        self.session_title.pack(anchor="w", pady=(4, 12))
+        self.session_title.pack(anchor="w", pady=(2, 6))
 
-        code_card = ttk.Frame(controls, style="Card.TFrame", padding=12)
-        code_card.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(code_card, text="ROOM CODE", style="Card.TLabel", foreground=MUTED, font=("Segoe UI", 8, "bold")).pack(anchor="w")
-        self.room_code_label = ttk.Label(
+        code_card = tk.Frame(controls, bg="#111A2B", highlightbackground="#263148", highlightthickness=1, padx=11, pady=6)
+        code_card.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(code_card, text="ROOM CODE", bg="#111A2B", fg="#AEBBD0", font=("Segoe UI", 7, "bold")).pack(anchor="w")
+        self.room_code_label = tk.Label(
             code_card,
             text="------",
-            style="Card.TLabel",
-            font=("Consolas", 22, "bold"),
+            bg="#111A2B",
+            fg=ACCENT,
+            font=("Consolas", 16, "bold"),
         )
-        self.room_code_label.pack(anchor="w", pady=(4, 0))
+        self.room_code_label.pack(anchor="w", pady=(1, 0))
 
-        self.name_label = ttk.Label(controls, text="", style="Panel.TLabel", foreground=MUTED)
-        self.name_label.pack(anchor="w", pady=(0, 10))
+        self.name_label = tk.Label(code_card, text="", bg="#111A2B", fg="#AEBBD0", font=("Segoe UI", 8))
+        self.name_label.pack(anchor="w", pady=(2, 0))
 
-        self.host_options = ttk.Frame(controls, style="Card.TFrame", padding=12)
-        self.host_options.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(
+        self.host_options = tk.Frame(controls, bg="#0B1220")
+        self.host_options.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(
             self.host_options,
             text="SHARING",
-            style="Card.TLabel",
-            foreground=MUTED,
+            bg="#0B1220",
+            fg="#AEBBD0",
             font=("Segoe UI", 8, "bold"),
-        ).pack(anchor="w", pady=(0, 6))
+        ).pack(anchor="w", pady=(0, 3))
         tk.Checkbutton(
             self.host_options,
             text="Share my screen",
             variable=self.host_share_screen,
             command=self._update_host_share_state,
-            bg=PANEL_2,
-            activebackground=PANEL_2,
+            bg="#0B1220",
+            activebackground="#0B1220",
             fg=TEXT,
             activeforeground=TEXT,
             selectcolor=INPUT,
@@ -1280,21 +1674,21 @@ class ScreenShareApp(tk.Tk):
             cursor="hand2",
             font=("Segoe UI", 9, "bold"),
             anchor="w",
-        ).pack(fill=tk.X, pady=(0, 4))
-        ttk.Label(
+        ).pack(fill=tk.X, pady=(0, 2))
+        tk.Label(
             self.host_options,
-            text="Video only",
-            style="Card.TLabel",
-            foreground=MUTED,
-            font=("Segoe UI", 9, "bold"),
-        ).pack(anchor="w", pady=(0, 4))
-        ttk.Label(
+            text="Video only  ⓘ",
+            bg="#0B1220",
+            fg="#AEBBD0",
+            font=("Segoe UI", 8),
+        ).pack(anchor="w", pady=(0, 2))
+        tk.Label(
             self.host_options,
             text="SOURCE",
-            style="Card.TLabel",
-            foreground=MUTED,
+            bg="#0B1220",
+            fg="#AEBBD0",
             font=("Segoe UI", 8, "bold"),
-        ).pack(anchor="w", pady=(14, 5))
+        ).pack(anchor="w", pady=(5, 3))
         self.source_combo = ttk.Combobox(
             self.host_options,
             textvariable=self.share_source,
@@ -1304,14 +1698,14 @@ class ScreenShareApp(tk.Tk):
         )
         self.source_combo.pack(fill=tk.X)
         self.source_combo.bind("<<ComboboxSelected>>", self._select_source)
-        self._small_button(self.host_options, "REFRESH SOURCES", self.refresh_sources).pack(fill=tk.X, pady=(8, 0))
-        ttk.Label(
+        self._small_button(self.host_options, "REFRESH SOURCES", self.refresh_sources).pack(fill=tk.X, pady=(5, 0))
+        tk.Label(
             self.host_options,
             text="QUALITY",
-            style="Card.TLabel",
-            foreground=MUTED,
+            bg="#0B1220",
+            fg="#AEBBD0",
             font=("Segoe UI", 8, "bold"),
-        ).pack(anchor="w", pady=(14, 5))
+        ).pack(anchor="w", pady=(5, 3))
         self.quality_combo = ttk.Combobox(
             self.host_options,
             textvariable=self.quality_profile,
@@ -1322,41 +1716,46 @@ class ScreenShareApp(tk.Tk):
         )
         self.quality_combo.pack(fill=tk.X)
         self.quality_combo.bind("<<ComboboxSelected>>", self._select_quality)
-        self.audio_note = ttk.Label(
+        self.audio_note = tk.Label(
             self.host_options,
             text="Audio streaming is not implemented; this room shares video only.",
-            style="Card.TLabel",
-            foreground=MUTED,
+            bg="#0B1220",
+            fg="#AEBBD0",
             wraplength=250,
             font=("Segoe UI", 8),
+            justify=tk.LEFT,
         )
-        self.audio_note.pack(anchor="w", pady=(10, 0))
-        ttk.Label(
+        self.audio_note.pack_forget()
+        tk.Label(
             self.host_options,
             textvariable=self.current_source_label,
-            style="Card.TLabel",
-            foreground=TEXT,
+            bg="#0B1220",
+            fg=TEXT,
             wraplength=250,
             font=("Segoe UI", 8, "bold"),
-        ).pack(anchor="w", pady=(6, 0))
+        ).pack_forget()
 
-        self.start_button = self._button(controls, "START", self.start, primary=True)
-        self.start_button.pack(fill=tk.X, pady=(0, 8))
+        self.start_button = self._button(controls, ">  START", self.start, primary=True)
+        self.start_button.configure(pady=4, font=("Segoe UI", 8, "bold"))
+        self.start_button.pack(fill=tk.X, pady=(0, 4))
         self.stop_button = self._button(controls, "STOP", self.stop)
+        self.stop_button.configure(pady=4, font=("Segoe UI", 8, "bold"))
         self.stop_button.configure(state=tk.DISABLED)
         self.stop_button.pack(fill=tk.X)
-        self.pause_button = self._button(controls, "PAUSE SHARING", self.toggle_pause_sharing)
+        self.pause_button = self._button(controls, "||  PAUSE SHARING", self.toggle_pause_sharing)
+        self.pause_button.configure(pady=4, font=("Segoe UI", 8, "bold"))
         self.pause_button.configure(state=tk.DISABLED)
-        self.pause_button.pack(fill=tk.X, pady=(8, 0))
+        self.pause_button.pack(fill=tk.X, pady=(4, 0))
         self.reconnect_button = self._button(controls, "RECONNECT", self.reconnect)
+        self.reconnect_button.configure(pady=4, font=("Segoe UI", 8, "bold"))
         self.reconnect_button.configure(state=tk.DISABLED)
-        self.reconnect_button.pack(fill=tk.X, pady=(8, 0))
+        self.reconnect_button.pack(fill=tk.X, pady=(4, 0))
         self.auto_reconnect_check = tk.Checkbutton(
             controls,
             text="Auto reconnect",
             variable=self.auto_reconnect_enabled,
-            bg=PANEL,
-            activebackground=PANEL,
+            bg="#0B1220",
+            activebackground="#0B1220",
             fg=TEXT,
             activeforeground=TEXT,
             selectcolor=INPUT,
@@ -1366,33 +1765,33 @@ class ScreenShareApp(tk.Tk):
             font=("Segoe UI", 9, "bold"),
             anchor="w",
         )
-        self.auto_reconnect_check.pack(fill=tk.X, pady=(8, 0))
+        self.auto_reconnect_check.pack(fill=tk.X, pady=(4, 0))
 
         self.fullscreen_button = self._button(controls, "FULLSCREEN", self.enter_fullscreen)
-        self.fullscreen_button.pack(fill=tk.X, pady=(8, 0))
+        self.fullscreen_button.configure(pady=4, font=("Segoe UI", 8, "bold"))
+        self.fullscreen_button.pack(fill=tk.X, pady=(4, 0))
 
-        self.back_button = self._button(controls, "BACK TO ROOMS", self.back_to_rooms)
-        self.back_button.pack(fill=tk.X, pady=(8, 0))
+        self.back_button = self._button(controls, "<-  BACK TO ROOMS", self.back_to_rooms)
+        self.back_button.configure(pady=4, font=("Segoe UI", 8, "bold"))
+        self.back_button.pack(fill=tk.X, pady=(4, 0))
 
-        info = ttk.Frame(controls, style="Card.TFrame", padding=14)
-        info.pack(fill=tk.X, pady=(14, 0))
-        ttk.Label(info, text="LAN ADDRESS", style="Card.TLabel", foreground=MUTED, font=("Segoe UI", 8, "bold")).pack(anchor="w")
-        self.lan_address_label = ttk.Label(
+        info = tk.Frame(controls, bg="#111A2B", highlightbackground="#263148", highlightthickness=1, padx=10, pady=8)
+        tk.Label(info, text="LAN ADDRESS", bg="#111A2B", fg="#AEBBD0", font=("Segoe UI", 7, "bold")).pack(anchor="w")
+        self.lan_address_label = tk.Label(
             info,
             text=f"{self._local_ip()}:{DEFAULT_PORT}",
-            style="Card.TLabel",
-            font=("Consolas", 14, "bold"),
+            bg="#111A2B",
+            fg=TEXT,
+            font=("Consolas", 11, "bold"),
         )
-        self.lan_address_label.pack(anchor="w", pady=(6, 0))
-        self._small_button(info, "COPY ADDRESS", self.copy_lan_address).pack(fill=tk.X, pady=(10, 0))
-        self._small_button(info, "COPY ROOM INFO", self.copy_room_info).pack(fill=tk.X, pady=(8, 0))
-        ttk.Label(info, text="Give this to viewers on your Wi-Fi.", style="Card.TLabel", foreground=MUTED, wraplength=245).pack(anchor="w", pady=(10, 0))
+        self.lan_address_label.pack(anchor="w", pady=(4, 0))
+        self._small_button(info, "COPY ADDRESS", self.copy_lan_address).pack(fill=tk.X, pady=(6, 0))
+        self._small_button(info, "COPY ROOM INFO", self.copy_room_info).pack(fill=tk.X, pady=(5, 0))
 
-        self.viewers_card = ttk.Frame(controls, style="Card.TFrame", padding=14)
-        self.viewers_card.pack(fill=tk.X, pady=(14, 0))
-        ttk.Label(self.viewers_card, text="VIEWERS", style="Card.TLabel", foreground=MUTED, font=("Segoe UI", 8, "bold")).pack(anchor="w")
-        ttk.Label(self.viewers_card, textvariable=self.viewer_count, style="Card.TLabel", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(6, 0))
-        ttk.Label(self.viewers_card, textvariable=self.viewer_list, style="Card.TLabel", foreground=MUTED, wraplength=245).pack(anchor="w", pady=(6, 0))
+        self.viewers_card = tk.Frame(controls, bg="#111A2B", highlightbackground="#263148", highlightthickness=1, padx=10, pady=8)
+        tk.Label(self.viewers_card, text="VIEWERS", bg="#111A2B", fg="#AEBBD0", font=("Segoe UI", 7, "bold")).pack(anchor="w")
+        tk.Label(self.viewers_card, textvariable=self.viewer_count, bg="#111A2B", fg=TEXT, font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(3, 0))
+        tk.Label(self.viewers_card, textvariable=self.viewer_list, bg="#111A2B", fg="#AEBBD0", wraplength=245, font=("Segoe UI", 8)).pack(anchor="w", pady=(3, 0))
 
     def continue_to_rooms(self):
         name = self.user_name.get().strip()
@@ -1417,7 +1816,7 @@ class ScreenShareApp(tk.Tk):
         self.room_code_label.configure(text=code)
         self.name_label.configure(text=f"Host: {self.user_name.get().strip()}")
         self.host_options.pack(fill=tk.X, pady=(0, 12))
-        self.display.configure(text=self._host_waiting_text(), image="")
+        self._set_display_message(self._host_waiting_text())
         self.start_button.configure(state=tk.NORMAL)
         self.stop_button.configure(state=tk.DISABLED)
         self.pause_button.configure(state=tk.DISABLED, text="PAUSE SHARING")
@@ -1444,7 +1843,7 @@ class ScreenShareApp(tk.Tk):
         self.name_label.configure(text=f"Viewer: {self.user_name.get().strip()}")
         self.host_options.pack_forget()
         self._update_viewers([])
-        self.display.configure(text="Click Start to join the room.", image="")
+        self._set_display_message("Click Start to join the room.")
         self.start_button.configure(state=tk.NORMAL)
         self.stop_button.configure(state=tk.DISABLED)
         self.pause_button.configure(state=tk.DISABLED)
@@ -1456,7 +1855,7 @@ class ScreenShareApp(tk.Tk):
     def back_to_rooms(self):
         self.stop()
         self.photo = None
-        self.display.configure(text="No active stream", image="")
+        self._set_display_message("No active stream")
         self._save_settings()
         self._show_page("room")
 
@@ -1639,14 +2038,14 @@ class ScreenShareApp(tk.Tk):
                 self.latest_packet = self.waiting_packet
                 self.latest_packet_version += 1
             self.pause_button.configure(text="RESUME SHARING")
-            self.display.configure(text="Sharing is paused.", image="")
+            self._set_display_message("Sharing is paused.")
             self._set_status("Sharing paused")
         else:
             self.share_enabled = self.host_share_screen.get()
             self.pause_button.configure(text="PAUSE SHARING")
             if self.share_enabled:
                 self._start_capture_thread()
-            self.display.configure(text=self._host_waiting_text(), image="")
+            self._set_display_message(self._host_waiting_text())
             self._set_status("Sharing resumed")
 
     def _handle_viewers_changed(self, viewers):
@@ -1672,6 +2071,173 @@ class ScreenShareApp(tk.Tk):
     def _set_status(self, value):
         self.after(0, self.status.set, value)
 
+    def _version_tuple(self, value):
+        parts = []
+        for part in str(value).strip().split("."):
+            digits = "".join(ch for ch in part if ch.isdigit())
+            parts.append(int(digits or 0))
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts[:3])
+
+    def check_for_updates(self):
+        if self.update_info:
+            return
+        threading.Thread(target=self._check_for_updates_worker, daemon=True).start()
+
+    def _check_for_updates_worker(self):
+        found_update = False
+        try:
+            request = urllib.request.Request(
+                UPDATE_MANIFEST_URL,
+                headers={"User-Agent": f"Watch/{APP_VERSION}"},
+            )
+            with urllib.request.urlopen(request, timeout=6) as response:
+                manifest = json.loads(response.read().decode("utf-8"))
+            latest = str(manifest.get("version", "")).strip()
+            if latest and self._version_tuple(latest) > self._version_tuple(APP_VERSION):
+                self.update_info = {
+                    "version": latest,
+                    "download_url": manifest.get("download_url") or DEFAULT_DOWNLOAD_URL,
+                    "notes": manifest.get("notes", ""),
+                }
+                found_update = True
+                self.after(0, self._show_update_available)
+        except (OSError, ValueError, urllib.error.URLError):
+            pass
+        finally:
+            if not found_update:
+                try:
+                    self.after(UPDATE_CHECK_INTERVAL_MS, self.check_for_updates)
+                except RuntimeError:
+                    pass
+
+    def _show_update_available(self):
+        if self.update_button and self.update_button.winfo_exists():
+            self.update_button.configure(text=f"Update {self.update_info['version']}")
+            self.update_button.grid()
+        self._set_status(f"Update {self.update_info['version']} available")
+
+    def show_update_dialog(self):
+        if not self.update_info:
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("Update Watch")
+        dialog.configure(bg=PANEL)
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        tk.Label(
+            dialog,
+            text=f"Update to version {self.update_info['version']}",
+            bg=PANEL,
+            fg=TEXT,
+            font=("Segoe UI", 16, "bold"),
+        ).pack(anchor="w", padx=24, pady=(22, 8))
+        notes = self.update_info.get("notes") or "A new version is available from GitHub."
+        tk.Label(
+            dialog,
+            text=notes,
+            bg=PANEL,
+            fg=MUTED,
+            justify=tk.LEFT,
+            wraplength=430,
+            font=("Segoe UI", 10),
+        ).pack(anchor="w", padx=24, pady=(0, 16))
+
+        progress = ttk.Progressbar(dialog, mode="determinate", length=430)
+        progress.pack(fill=tk.X, padx=24, pady=(0, 8))
+        status_label = tk.Label(dialog, text="Ready to download", bg=PANEL, fg=MUTED, font=("Segoe UI", 9))
+        status_label.pack(anchor="w", padx=24, pady=(0, 18))
+
+        buttons = tk.Frame(dialog, bg=PANEL)
+        buttons.pack(fill=tk.X, padx=24, pady=(0, 22))
+        cancel_button = self._small_button(buttons, "CANCEL", dialog.destroy)
+        cancel_button.pack(side=tk.RIGHT)
+        update_button = self._button(
+            buttons,
+            "UPDATE NOW",
+            lambda: self._start_update_download(dialog, progress, status_label, update_button, cancel_button),
+            primary=True,
+        )
+        update_button.pack(side=tk.RIGHT, padx=(0, 10))
+
+        dialog.update_idletasks()
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - dialog.winfo_width()) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - dialog.winfo_height()) // 2)
+        dialog.geometry(f"+{x}+{y}")
+
+    def _start_update_download(self, dialog, progress, status_label, update_button, cancel_button):
+        update_button.configure(state=tk.DISABLED)
+        cancel_button.configure(state=tk.DISABLED)
+        status_label.configure(text="Downloading update...")
+        threading.Thread(
+            target=self._download_update_worker,
+            args=(dialog, progress, status_label),
+            daemon=True,
+        ).start()
+
+    def _download_update_worker(self, dialog, progress, status_label):
+        try:
+            url = self.update_info.get("download_url") or DEFAULT_DOWNLOAD_URL
+            target = os.path.join(tempfile.gettempdir(), "Watch-update.exe")
+            request = urllib.request.Request(url, headers={"User-Agent": f"Watch/{APP_VERSION}"})
+            with urllib.request.urlopen(request, timeout=15) as response, open(target, "wb") as output:
+                total = int(response.headers.get("Content-Length") or 0)
+                downloaded = 0
+                while True:
+                    chunk = response.read(1024 * 128)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    downloaded += len(chunk)
+                    if total:
+                        percent = min(100, int(downloaded * 100 / total))
+                        self.after(0, progress.configure, {"value": percent})
+                        self.after(0, status_label.configure, {"text": f"Downloading update... {percent}%"})
+                    else:
+                        self.after(0, status_label.configure, {"text": f"Downloaded {downloaded // 1024} KB"})
+            self.after(0, self._finish_update, dialog, status_label, target)
+        except Exception as exc:
+            self.after(0, status_label.configure, {"text": f"Update failed: {exc}"})
+
+    def _finish_update(self, dialog, status_label, downloaded_exe):
+        status_label.configure(text="Download complete. Restarting...")
+        current_exe = sys.executable if getattr(sys, "frozen", False) else os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist", "Watch.exe")
+        if not getattr(sys, "frozen", False):
+            try:
+                os.makedirs(os.path.dirname(current_exe), exist_ok=True)
+                with open(downloaded_exe, "rb") as src, open(current_exe, "wb") as dst:
+                    while True:
+                        chunk = src.read(1024 * 128)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+                dialog.destroy()
+                messagebox.showinfo("Update ready", "dist\\Watch.exe has been updated.")
+                return
+            except OSError as exc:
+                status_label.configure(text=f"Could not install update: {exc}")
+                return
+
+        updater = os.path.join(tempfile.gettempdir(), "watch_apply_update.bat")
+        script = "\r\n".join([
+            "@echo off",
+            "timeout /t 2 /nobreak >nul",
+            f'copy /y "{downloaded_exe}" "{current_exe}" >nul',
+            f'start "" "{current_exe}"',
+            f'del "{downloaded_exe}" >nul 2>nul',
+            'del "%~f0" >nul 2>nul',
+        ])
+        try:
+            with open(updater, "w", encoding="utf-8") as updater_file:
+                updater_file.write(script)
+            subprocess.Popen(["cmd", "/c", updater], close_fds=True)
+            self.destroy()
+        except OSError as exc:
+            status_label.configure(text=f"Could not apply update: {exc}")
+
     def _load_settings(self):
         try:
             with open(SETTINGS_FILE, "r", encoding="utf-8") as settings_file:
@@ -1679,14 +2245,15 @@ class ScreenShareApp(tk.Tk):
         except (OSError, ValueError):
             return
         self.user_name.set(str(settings.get("user_name", "")))
-        self.host.set(str(settings.get("host", self.host.get())))
+        saved_host = str(settings.get("host", "")).strip()
+        self.host.set("" if saved_host == "127.0.0.1" else saved_host)
         try:
             self.port.set(int(settings.get("port", self.port.get())))
         except (TypeError, ValueError, tk.TclError):
             self.port.set(DEFAULT_PORT)
         quality = settings.get("quality", self.quality_profile.get())
         if quality in QUALITY_PROFILES:
-            self.quality_profile.set(quality)
+            self.quality_profile.set("Balanced" if quality == "High" else quality)
         self.mode.set(settings.get("last_mode", self.mode.get()) if settings.get("last_mode") in ("share", "watch") else self.mode.get())
         self.auto_reconnect_enabled.set(bool(settings.get("auto_reconnect", True)))
 
@@ -1718,7 +2285,7 @@ class ScreenShareApp(tk.Tk):
                     self.latest_frame = self._waiting_frame()
                     self.latest_packet = self.waiting_packet
                 if self.display:
-                    self.display.configure(text=self._host_waiting_text(), image="")
+                    self._set_display_message(self._host_waiting_text())
         finally:
             self.after(CAPTURE_INTERVAL_MS, self._schedule_preview)
 
@@ -1753,6 +2320,7 @@ class ScreenShareApp(tk.Tk):
         frame_interval = 1 / STREAM_FPS
         next_capture_time = time.monotonic()
         while self.capture_stop_event and not self.capture_stop_event.is_set():
+            started = time.monotonic()
             try:
                 frame = self._capture_selected_source()
                 packet = make_packet(*frame, jpeg_quality=self._quality_settings()["quality"])
@@ -1761,6 +2329,9 @@ class ScreenShareApp(tk.Tk):
                     self.latest_packet = packet
                     self.latest_packet_version += 1
                 self.capture_error = None
+                elapsed = time.monotonic() - started
+                if elapsed > frame_interval * 1.5:
+                    self._set_status("Streaming is heavy; lower quality if lag continues")
             except Exception as exc:
                 self.capture_error = str(exc)
             next_capture_time += frame_interval
@@ -1808,7 +2379,7 @@ class ScreenShareApp(tk.Tk):
         self.share_enabled = self.host_share_screen.get()
         if self.pause_button:
             self.pause_button.configure(text="PAUSE SHARING")
-        self.display.configure(text=self._host_waiting_text(), image="")
+        self._set_display_message(self._host_waiting_text())
         if self.share_enabled:
             self._focus_selected_source()
             if self.server:
@@ -1879,19 +2450,21 @@ class ScreenShareApp(tk.Tk):
                 self.last_preview_time = now
                 self._render_frame(*frame)
         except Exception as exc:
-            self.display.configure(text=f"Screen capture failed: {exc}", image="")
+            self._set_display_message(f"Screen capture failed: {exc}")
 
     def _show_host_preview(self):
         if self.capture_error:
-            self.display.configure(text=f"Screen capture failed: {self.capture_error}", image="")
+            self._set_display_message(f"Screen capture failed: {self.capture_error}")
             return
         now = time.monotonic()
         if now - self.last_preview_time < PREVIEW_INTERVAL_MS / 1000:
             return
+        if not self.display or self.display.winfo_width() < 80 or self.display.winfo_height() < 80:
+            return
         with self.packet_lock:
             frame = self.latest_frame
         if frame is None:
-            self.display.configure(text="Preparing stream...", image="")
+            self._set_display_message("Preparing stream...")
             return
         self.last_preview_time = now
         self._render_frame(*frame)
@@ -1921,7 +2494,7 @@ class ScreenShareApp(tk.Tk):
             self.current_rgb_frame = None
             self.photo = None
             if self.display:
-                self.display.configure(text="Host is connected. Screen sharing is off or paused.", image="")
+                self._set_display_message("Host is connected. Screen sharing is off or paused.")
             return
         self._render_frame(width, height, frame_data)
 
@@ -1977,6 +2550,7 @@ class ScreenShareApp(tk.Tk):
             render_width = min(target_width, MAX_RENDER_WIDTH)
             render_height = min(target_height, MAX_RENDER_HEIGHT)
             self.photo = photo_for(render_width, render_height)
+            self.display_message = None
             
             if self.display.cget("text"):
                 self.display.configure(text="")
