@@ -21,17 +21,17 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 
 APP_VERSION = "1.0.7"
-GITHUB_REPO = "GianCarlozxc/Palabas-updates"
-UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/GianCarlozxc/Palabas-updates/main/update.json"
-DEFAULT_DOWNLOAD_URL = "https://github.com/GianCarlozxc/Palabas-updates/raw/main/Watch.exe"
+GITHUB_REPO = "GianCarlozxc/Palabas"
+UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/GianCarlozxc/Palabas/main/update.json"
+DEFAULT_DOWNLOAD_URL = "https://github.com/GianCarlozxc/Palabas/raw/main/dist/Watch.exe"
 UPDATE_MANIFEST_URLS = [
     UPDATE_MANIFEST_URL,
     f"https://api.github.com/repos/{GITHUB_REPO}/contents/update.json?ref=main",
 ]
 DOWNLOAD_URLS = [
     DEFAULT_DOWNLOAD_URL,
-    f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/Watch.exe",
-    f"https://api.github.com/repos/{GITHUB_REPO}/contents/Watch.exe?ref=main",
+    f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/dist/Watch.exe",
+    f"https://api.github.com/repos/{GITHUB_REPO}/contents/dist/Watch.exe?ref=main",
 ]
 UPDATE_CHECK_INTERVAL_MS = 5 * 60 * 1000
 FRAME_HEADER = struct.Struct("!III")
